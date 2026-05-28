@@ -1,12 +1,14 @@
 """
-Razer Battery Monitor — serveur local invisible (Windows).
-Sert le widget iCUE Dashboard sur http://localhost:8765/
+Razer Battery Monitor — serveur local HTTPS invisible (Windows).
+Sert le widget iCUE Dashboard sur https://localhost:8765/
 Lance avec : pythonw server.py  OU  RazerBattery.exe (build PyInstaller)
 """
 import sys
+import os
 import threading
 import time
 import logging
+from pathlib import Path
 
 # ── Masquer la console Windows immédiatement ────────────────────────────────
 if sys.platform == 'win32':
@@ -14,18 +16,63 @@ if sys.platform == 'win32':
         import ctypes
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE = 0
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
     except Exception:
         pass
 
-logging.disable(logging.CRITICAL)  # silence Flask/Werkzeug
+logging.disable(logging.CRITICAL)
 
 from flask import Flask, jsonify, Response
 from flask_cors import CORS
 import razer_hid
 
+# ── Certificat SSL ───────────────────────────────────────────────────────────
+
+def _cert_dir() -> Path:
+    base = os.environ.get('APPDATA') or str(Path.home())
+    return Path(base) / 'RazerBattery'
+
+
+def _ensure_cert(cert_path: Path, key_path: Path) -> None:
+    """Génère un certificat auto-signé valable 10 ans si absent."""
+    if cert_path.exists() and key_path.exists():
+        return
+
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import datetime, ipaddress
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'localhost')])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName('localhost'),
+                x509.IPAddress(ipaddress.IPv4Address('127.0.0.1')),
+            ]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL,
+        serialization.NoEncryption(),
+    ))
+
+
 # ── Widget HTML embarqué ─────────────────────────────────────────────────────
-# Modifie ce bloc pour changer l'apparence du widget iCUE.
 WIDGET_HTML = """<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -70,12 +117,12 @@ WIDGET_HTML = """<!DOCTYPE html>
 <body>
 <header>
   <div class="logo">RAZER<small>battery</small></div>
-  <button class="refresh" title="Rafraîchir" onclick="refresh()">↻</button>
+  <button class="refresh" title="Rafraîchir" onclick="refresh()">&#8635;</button>
 </header>
 <div id="list"></div>
 <footer id="ts"></footer>
 <script>
-const ICO={mouse:'\\u{1F5B1}',keyboard:'\\u2328',headset:'\\u{1F3A7}',other:'\\u{1F3AE}'};
+const ICO={mouse:'&#128433;',keyboard:'&#9000;',headset:'&#127911;',other:'&#127918;'};
 function cls(p){return p>=60?'g':p>=30?'y':'r'}
 
 function render(devices){
@@ -85,7 +132,7 @@ function render(devices){
     return;
   }
   el.innerHTML=devices.map(d=>{
-    const ico=String.fromCodePoint(...[...ICO[d.type]||ICO.other].map(c=>c.codePointAt(0)));
+    const ico=ICO[d.type]||ICO.other;
     if(d.wired) return `<div class="card"><span class="ico">${ico}</span>
       <div class="info"><div class="name">${d.name}</div><div class="wired">Filaire</div></div></div>`;
     const c=cls(d.percent),plug=d.charging?'<span class="plug">&#9889;</span>':'';
@@ -155,6 +202,19 @@ def api_devices():
 
 # ── Démarrage ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    _refresh()  # première lecture synchrone
+    d = _cert_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    cert_file = d / 'cert.pem'
+    key_file  = d / 'key.pem'
+    _ensure_cert(cert_file, key_file)
+
+    _refresh()
     threading.Thread(target=_loop, daemon=True).start()
-    app.run(host='127.0.0.1', port=8765, debug=False, threaded=True)
+
+    app.run(
+        host='127.0.0.1',
+        port=8765,
+        ssl_context=(str(cert_file), str(key_file)),
+        debug=False,
+        threaded=True,
+    )
