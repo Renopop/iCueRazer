@@ -8,6 +8,8 @@ import hid
 import sys
 import time
 import asyncio
+import threading
+import subprocess as _subprocess
 
 RAZER_VID = 0x1532
 
@@ -260,20 +262,72 @@ async def _get_bt_devices_async() -> list[dict]:
     return list(merged.values())
 
 
-def _get_bt_devices() -> list[dict]:
-    """Wrapper synchrone pour _get_bt_devices_async."""
+def _get_bt_battery_ps() -> list[dict]:
+    """Fallback : lit la batterie BT Razer via PowerShell Get-PnpDeviceProperty."""
     if sys.platform != 'win32':
         return []
+    ps = (
+        "Get-PnpDevice -FriendlyName '*Razer*' | ForEach-Object {"
+        "  try {"
+        "    $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId"
+        "    -KeyName 'System.Devices.BatteryStrengthPercent' -ErrorAction Stop;"
+        "    if ($null -ne $p.Data -and $p.Data -gt 0) { $_.FriendlyName + '|' + [int]$p.Data }"
+        "  } catch {} }"
+    )
     try:
-        loop = asyncio.new_event_loop()
-        return loop.run_until_complete(_get_bt_devices_async())
+        r = _subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+            capture_output=True, text=True, timeout=15,
+            creationflags=0x08000000,
+        )
+        result = []
+        for line in r.stdout.strip().splitlines():
+            line = line.strip()
+            if '|' not in line:
+                continue
+            name, _, pct = line.partition('|')
+            name, pct = name.strip(), pct.strip()
+            if _is_allowed(name):
+                try:
+                    result.append({
+                        'name': name, 'type': _device_type(name),
+                        'percent': int(pct), 'charging': False,
+                    })
+                except ValueError:
+                    pass
+        return result
     except Exception:
         return []
-    finally:
+
+
+def _get_bt_devices() -> list[dict]:
+    """Essaie WinRT en thread STA, puis PowerShell en fallback."""
+    if sys.platform != 'win32':
+        return []
+
+    result: list[dict] = []
+
+    def _winrt_worker() -> None:
+        nonlocal result
         try:
-            loop.close()
+            import ctypes
+            ctypes.windll.ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+            try:
+                result = asyncio.run(_get_bt_devices_async())
+            finally:
+                ctypes.windll.ole32.CoUninitialize()
         except Exception:
             pass
+
+    t = threading.Thread(target=_winrt_worker, daemon=True)
+    t.start()
+    t.join(timeout=20)
+
+    if result:
+        return result
+
+    # Fallback PowerShell si WinRT échoue
+    return _get_bt_battery_ps()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

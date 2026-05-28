@@ -357,6 +357,46 @@ def api_battery_debug():
     return jsonify({'hid': hid_results, 'bluetooth': bt_results})
 
 
+@app.route('/api/bt_ps_debug')
+def api_bt_ps_debug():
+    """
+    Diagnostic PowerShell : liste la propriété BatteryStrengthPercent de TOUS
+    les appareils PnP (pas seulement Razer) pour vérifier ce que Windows sait.
+    Accède à https://localhost:8765/api/bt_ps_debug
+    """
+    import subprocess
+    ps = (
+        "Get-PnpDevice | ForEach-Object {"
+        "  try {"
+        "    $p = Get-PnpDeviceProperty -InstanceId $_.InstanceId"
+        "    -KeyName 'System.Devices.BatteryStrengthPercent' -ErrorAction Stop;"
+        "    if ($null -ne $p.Data) {"
+        "      [PSCustomObject]@{Name=$_.FriendlyName;InstanceId=$_.InstanceId;Battery=$p.Data} | ConvertTo-Json -Compress"
+        "    }"
+        "  } catch {} }"
+    )
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+            capture_output=True, text=True, timeout=30,
+            creationflags=0x08000000,
+        )
+        lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+        import json
+        devices = []
+        for l in lines:
+            try:
+                devices.append(json.loads(l))
+            except Exception:
+                devices.append({'raw': l})
+        return jsonify({
+            'devices_with_battery': devices,
+            'stderr': r.stderr.strip() or None,
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
 # ── Démarrage ────────────────────────────────────────────────────────────────
 def _log(msg: str) -> None:
     """Écrit dans %APPDATA%\RazerBattery\server.log pour le diagnostic."""
