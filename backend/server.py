@@ -316,31 +316,36 @@ def api_battery_debug():
                 pass
         hid_results.append(entry)
 
-    # ── Bluetooth : System.Devices.BatteryStrengthPercent ────────────────────
+    # ── Bluetooth : sélecteurs natifs BluetoothDevice / BluetoothLEDevice ──────
     bt_results: list = []
     if sys.platform == 'win32':
         try:
             import asyncio
             from winrt.windows.devices.enumeration import DeviceInformation
+            from winrt.windows.devices.bluetooth import BluetoothDevice, BluetoothLEDevice
             BT_PROP = 'System.Devices.BatteryStrengthPercent'
-            AQS = 'System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True'
 
             async def _bt():
-                try:
-                    devs = await DeviceInformation.find_all_async(AQS)
-                except Exception as ex:
-                    return [{'error': f'find_all_async: {ex}'}]
                 out = []
-                for d in devs:
-                    n = d.name or ''
-                    if 'razer' not in n.lower():
-                        continue
+                for label, aqs in [
+                    ('classic', BluetoothDevice.get_device_selector()),
+                    ('ble',     BluetoothLEDevice.get_device_selector()),
+                ]:
                     try:
-                        d2 = await DeviceInformation.create_from_id_async(d.id, [BT_PROP])
-                        raw = d2.properties[BT_PROP]
+                        devs = await DeviceInformation.find_all_async(aqs)
                     except Exception as ex:
-                        raw = f'error: {ex}'
-                    out.append({'name': n, 'id': str(d.id), BT_PROP: raw})
+                        out.append({'error': f'{label} find_all_async: {ex}'})
+                        continue
+                    for d in devs:
+                        n = d.name or ''
+                        if 'razer' not in n.lower():
+                            continue
+                        try:
+                            d2 = await DeviceInformation.create_from_id_async(d.id, [BT_PROP])
+                            raw = d2.properties[BT_PROP]
+                        except Exception as ex:
+                            raw = f'error: {ex}'
+                        out.append({'bt_type': label, 'name': n, 'id': str(d.id), BT_PROP: raw})
                 return out
 
             loop = asyncio.new_event_loop()

@@ -208,56 +208,56 @@ async def _gatt_battery(device_id: str) -> int | None:
 
 async def _get_bt_devices_async() -> list[dict]:
     """
-    Énumère les appareils Bluetooth appairés via find_all_async(AQS) — version
-    1-paramètre compatible avec toutes les versions du package winrt.
-    Lit System.Devices.BatteryStrengthPercent via create_from_id_async pour
-    chaque appareil Razer ; tombe en fallback GATT BAS pour les appareils BLE.
+    Énumère les appareils Bluetooth appairés en deux passes :
+      1. BluetoothDevice.get_device_selector()   → BT classique (BlackWidow V3 Mini)
+      2. BluetoothLEDevice.get_device_selector() → BLE (Cobra Pro)
+    Ces sélecteurs génèrent un AQS valide sans nécessiter DeviceInformationKind.
+    Battery : System.Devices.BatteryStrengthPercent via create_from_id_async,
+    puis fallback GATT BAS pour les appareils BLE.
     """
     try:
         from winrt.windows.devices.enumeration import DeviceInformation
+        from winrt.windows.devices.bluetooth import BluetoothDevice, BluetoothLEDevice
     except ImportError:
         return []
 
-    AQS = 'System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True'
+    merged: dict[str, dict] = {}
 
-    try:
-        devices = await DeviceInformation.find_all_async(AQS)
-    except Exception:
-        return []
-
-    result: list[dict] = []
-    for dev in devices:
-        name = dev.name or ''
-        if 'razer' not in name.lower() or not _is_allowed(name):
-            continue
-
-        entry: dict = {'id': dev.id, 'name': name, 'type': _device_type(name)}
-
-        # 1. Propriété Windows (BT classique + BLE) — chargée via create_from_id_async
+    async def _scan(aqs: str, gatt_fallback: bool) -> None:
         try:
-            dev2 = await DeviceInformation.create_from_id_async(
-                dev.id, [_BT_BATTERY_PROP]
-            )
-            raw = dev2.properties[_BT_BATTERY_PROP]
-            if raw is not None and int(raw) > 0:
-                entry['percent']  = int(raw)
-                entry['charging'] = False
+            devs = await DeviceInformation.find_all_async(aqs)
         except Exception:
-            pass
+            return
+        for dev in devs:
+            name = dev.name or ''
+            if 'razer' not in name.lower() or not _is_allowed(name):
+                continue
+            entry: dict = {'id': dev.id, 'name': name, 'type': _device_type(name)}
+            # Propriété Windows battery
+            try:
+                dev2 = await DeviceInformation.create_from_id_async(
+                    dev.id, [_BT_BATTERY_PROP]
+                )
+                raw = dev2.properties[_BT_BATTERY_PROP]
+                if raw is not None and int(raw) > 0:
+                    entry['percent']  = int(raw)
+                    entry['charging'] = False
+            except Exception:
+                pass
+            # Fallback GATT BAS (BLE uniquement)
+            if 'percent' not in entry and gatt_fallback:
+                pct = await _gatt_battery(dev.id)
+                if pct is not None and pct > 0:
+                    entry['percent']  = pct
+                    entry['charging'] = False
+            if 'percent' not in entry:
+                entry['wired'] = True
+            if name not in merged or 'percent' in entry:
+                merged[name] = entry
 
-        # 2. Fallback GATT BAS (BLE uniquement, si propriété vide)
-        if 'percent' not in entry:
-            pct = await _gatt_battery(dev.id)
-            if pct is not None and pct > 0:
-                entry['percent']  = pct
-                entry['charging'] = False
-
-        if 'percent' not in entry:
-            entry['wired'] = True
-
-        result.append(entry)
-
-    return result
+    await _scan(BluetoothDevice.get_device_selector(),   gatt_fallback=False)
+    await _scan(BluetoothLEDevice.get_device_selector(), gatt_fallback=True)
+    return list(merged.values())
 
 
 def _get_bt_devices() -> list[dict]:
