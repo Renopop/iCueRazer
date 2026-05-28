@@ -85,28 +85,43 @@ def _try_read_battery(path: bytes) -> dict | None:
     Tente de lire la batterie depuis un chemin d'interface HID.
     Essaie plusieurs variantes de commande pour la compatibilité Synapse 3.
     Retourne {'percent': int, 'charging': bool} ou None si non supporté.
+
+    Réponse sur 91 octets (report-ID inclus) :
+      resp[0]  = report-ID (0x00)
+      resp[1]  = status   (0x02 succès, 0x01 busy-but-valid, 0x04 timeout)
+      resp[2]  = transaction_id  ← validé pour confirmer que c'est notre réponse
+      resp[9]  = args[0] = état de charge (0x01 = en charge)
+      resp[10] = args[1] = niveau batterie brut 0–255
     """
     dev = hid.device()
     try:
         dev.open_path(path)
-        # Délai pour laisser Synapse finir une éventuelle transaction en cours
-        time.sleep(0.05)
+        time.sleep(0.05)   # laisse Synapse finir une transaction en cours
 
         for (tid, cls_, cid) in _VARIANTS:
             try:
                 report = _build_report(tid, cls_, cid, (0x01,))
                 dev.send_feature_report(b'\x00' + report)
-                time.sleep(0.12)
+                time.sleep(0.25)                      # 250 ms (Synapse peut être lent)
                 resp = dev.get_feature_report(0x00, 91)
 
                 if len(resp) < 11:
                     continue
-                # resp[0]=report-ID, resp[1]=status (0x02=succès)
-                if resp[1] != 0x02:
+
+                status = resp[1]
+                # 0x02 = succès, 0x01 = busy (données souvent valides quand même)
+                # 0x00 / 0x04 / 0x05 = pas de données exploitables
+                if status not in (0x01, 0x02):
+                    continue
+
+                # Valider le transaction_id pour éviter de lire une réponse Synapse
+                if resp[2] != tid:
                     continue
 
                 charging = (resp[9] == 0x01)
                 raw      = resp[10]            # 0–255
+                if raw == 0 and status != 0x02:
+                    continue                   # données probablement parasites
                 percent  = min(100, max(0, round(raw / 255 * 100)))
                 return {'percent': percent, 'charging': charging}
 

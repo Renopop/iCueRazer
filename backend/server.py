@@ -200,6 +200,46 @@ def api_devices():
         return jsonify({'devices': _cache['devices'], 'updated': _cache['ts']})
 
 
+@app.route('/api/debug')
+def api_debug():
+    """
+    Diagnostic : liste TOUS les appareils Razer HID détectés (sans filtre),
+    avec leurs interfaces et les noms tels que vus par hidapi.
+    Accède à https://localhost:8765/api/debug pour diagnostiquer.
+    """
+    import hid
+    RAZER_VID = 0x1532
+    try:
+        all_ifaces = hid.enumerate(RAZER_VID)
+    except Exception as e:
+        return jsonify({'error': str(e), 'devices': []})
+
+    by_pid: dict = {}
+    for iface in all_ifaces:
+        pid = iface['product_id']
+        by_pid.setdefault(pid, []).append({
+            'path':        iface.get('path', b'').decode('utf-8', errors='replace'),
+            'usage_page':  hex(iface.get('usage_page', 0)),
+            'usage':       hex(iface.get('usage', 0)),
+            'interface':   iface.get('interface_number', -1),
+        })
+
+    devices = [
+        {
+            'product_id':   hex(pid),
+            'product_name': ifaces_raw[0].get('product_string', '?')
+                            if all_ifaces else '?',
+            'interfaces':   by_pid[pid],
+        }
+        for pid, ifaces_raw in [
+            (pid, [i for i in all_ifaces if i['product_id'] == pid])
+            for pid in by_pid
+        ]
+    ]
+
+    return jsonify({'razer_devices_found': len(devices), 'devices': devices})
+
+
 # ── Démarrage ────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     d = _cert_dir()
