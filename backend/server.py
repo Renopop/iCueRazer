@@ -241,20 +241,48 @@ def api_debug():
 
 
 # ── Démarrage ────────────────────────────────────────────────────────────────
+def _log(msg: str) -> None:
+    """Écrit dans %APPDATA%\RazerBattery\server.log pour le diagnostic."""
+    try:
+        log_file = _cert_dir() / 'server.log'
+        with open(log_file, 'a', encoding='utf-8') as f:
+            f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
     d = _cert_dir()
     d.mkdir(parents=True, exist_ok=True)
+    _log('Démarrage RazerBattery')
+
     cert_file = d / 'cert.pem'
     key_file  = d / 'key.pem'
-    _ensure_cert(cert_file, key_file)
+    ssl_context = None
 
-    _refresh()
+    try:
+        _ensure_cert(cert_file, key_file)
+        ssl_context = (str(cert_file), str(key_file))
+        _log('SSL OK — https://localhost:8765/')
+    except Exception as e:
+        # Fallback HTTP si la génération du certificat échoue
+        _log(f'SSL ERREUR ({e}) — fallback HTTP sur http://localhost:8765/')
+
+    try:
+        _refresh()
+    except Exception as e:
+        _log(f'Erreur lecture HID initiale : {e}')
+
     threading.Thread(target=_loop, daemon=True).start()
 
-    app.run(
-        host='127.0.0.1',
-        port=8765,
-        ssl_context=(str(cert_file), str(key_file)),
-        debug=False,
-        threaded=True,
-    )
+    try:
+        _log(f'Flask bind 127.0.0.1:8765 (ssl={ssl_context is not None})')
+        app.run(
+            host='127.0.0.1',
+            port=8765,
+            ssl_context=ssl_context,
+            debug=False,
+            threaded=True,
+        )
+    except Exception as e:
+        _log(f'Flask ERREUR : {e}')
