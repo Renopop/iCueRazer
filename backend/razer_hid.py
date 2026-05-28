@@ -12,6 +12,20 @@ import time
 
 RAZER_VID = 0x1532
 
+# ── Filtre des appareils affichés ────────────────────────────────────────────
+# Seuls les appareils dont le nom contient l'une de ces chaînes (insensible à
+# la casse) sont remontés. Modifie cette liste pour ajouter/retirer un modèle.
+ALLOWED_DEVICES = [
+    'blackwidow v3 mini',
+    'kraken v3 pro',
+    'cobra pro',
+]
+
+def _is_allowed(name: str) -> bool:
+    n = name.lower()
+    return any(allowed in n for allowed in ALLOWED_DEVICES)
+
+
 _TYPE_KEYWORDS = {
     'mouse': [
         'mouse', 'deathadder', 'viper', 'basilisk', 'mamba', 'naga',
@@ -130,6 +144,8 @@ def get_all_devices() -> list[dict]:
 
     for pid, ifaces in by_pid.items():
         name  = ifaces[0].get('product_string') or f'Razer 0x{pid:04X}'
+        if not _is_allowed(name):
+            continue
         dtype = _device_type(name)
 
         # Priorité : interface Usage Page 0x0001 (Generic Desktop) d'abord,
