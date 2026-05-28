@@ -90,27 +90,30 @@ _VARIANTS = [
 ]
 
 
-def _try_hid_battery(path: bytes, slot: int = 0x01) -> dict | None:
+def _try_hid_battery(path: bytes, slot: int = 0x01, usage_page: int = 0) -> dict | None:
+    # Les interfaces 0x59 (HyperSpeed propriétaire) peuvent nécessiter report ID 0x01
+    rep_ids = (0x00, 0x01) if usage_page == 0x59 else (0x00,)
     dev = hid.device()
     try:
         dev.open_path(path)
         time.sleep(0.05)
         for (tid, cls_, cid) in _VARIANTS:
-            try:
-                dev.send_feature_report(b'\x00' + _build_report(tid, cls_, cid, (slot,)))
-                time.sleep(0.25)
-                resp = dev.get_feature_report(0x00, 91)
-                if len(resp) < 11 or resp[1] not in (0x01, 0x02):
+            for rep_id in rep_ids:
+                try:
+                    dev.send_feature_report(bytes([rep_id]) + _build_report(tid, cls_, cid, (slot,)))
+                    time.sleep(0.25)
+                    resp = dev.get_feature_report(rep_id, 91)
+                    if len(resp) < 11 or resp[1] not in (0x01, 0x02):
+                        continue
+                    raw = resp[10]
+                    if raw == 0:
+                        continue
+                    return {
+                        'percent':  min(100, max(0, round(raw / 255 * 100))),
+                        'charging': resp[9] == 0x01,
+                    }
+                except Exception:
                     continue
-                raw = resp[10]
-                if raw == 0:
-                    continue
-                return {
-                    'percent':  min(100, max(0, round(raw / 255 * 100))),
-                    'charging': resp[9] == 0x01,
-                }
-            except Exception:
-                continue
     except Exception:
         pass
     finally:
@@ -146,7 +149,7 @@ def _get_hid_devices() -> list[dict]:
         ordered = sorted(ifaces, key=_iface_priority)
         battery = None
         for iface in ordered:
-            battery = _try_hid_battery(iface['path'], slot)
+            battery = _try_hid_battery(iface['path'], slot, iface.get('usage_page', 0))
             if battery:
                 break
         entry: dict = {'id': pid, 'name': name, 'type': dtype}
@@ -205,33 +208,22 @@ async def _gatt_battery(device_id: str) -> int | None:
 
 async def _get_bt_devices_async() -> list[dict]:
     """
-    Énumère TOUS les appareils Bluetooth appairés (classique + BLE) via
-    DeviceInformation.find_all_async avec le kind AssociationEndpoint.
-    Lit System.Devices.BatteryStrengthPercent (géré par Windows pour les deux
-    types de BT) puis tombe en fallback GATT BAS pour les appareils BLE.
+    Énumère les appareils Bluetooth appairés via find_all_async(AQS) — version
+    1-paramètre compatible avec toutes les versions du package winrt.
+    Lit System.Devices.BatteryStrengthPercent via create_from_id_async pour
+    chaque appareil Razer ; tombe en fallback GATT BAS pour les appareils BLE.
     """
     try:
-        from winrt.windows.devices.enumeration import (
-            DeviceInformation, DeviceInformationKind,
-        )
+        from winrt.windows.devices.enumeration import DeviceInformation
     except ImportError:
         return []
 
-    # AQS : tous les appareils Bluetooth appairés
     AQS = 'System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True'
 
     try:
-        devices = await DeviceInformation.find_all_async(
-            AQS,
-            [_BT_BATTERY_PROP],
-            DeviceInformationKind.ASSOCIATION_ENDPOINT,
-        )
+        devices = await DeviceInformation.find_all_async(AQS)
     except Exception:
-        try:
-            # Certaines versions winrt n'exposent pas le paramètre kind
-            devices = await DeviceInformation.find_all_async(AQS, [_BT_BATTERY_PROP])
-        except Exception:
-            return []
+        return []
 
     result: list[dict] = []
     for dev in devices:
@@ -241,9 +233,12 @@ async def _get_bt_devices_async() -> list[dict]:
 
         entry: dict = {'id': dev.id, 'name': name, 'type': _device_type(name)}
 
-        # 1. Propriété Windows (fonctionne pour BT classique + BLE)
+        # 1. Propriété Windows (BT classique + BLE) — chargée via create_from_id_async
         try:
-            raw = dev.properties[_BT_BATTERY_PROP]
+            dev2 = await DeviceInformation.create_from_id_async(
+                dev.id, [_BT_BATTERY_PROP]
+            )
+            raw = dev2.properties[_BT_BATTERY_PROP]
             if raw is not None and int(raw) > 0:
                 entry['percent']  = int(raw)
                 entry['charging'] = False
