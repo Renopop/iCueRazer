@@ -2,3 +2,9 @@ hidapi==0.14.0
 flask==3.1.0
 flask-cors==5.0.0
 cryptography>=42.0.0
+# Bluetooth LE (WinRT) — lit la batterie des appareils BT non visibles en HID
+winrt-runtime>=2.2.0; sys_platform=="win32"
+winrt-Windows.Devices.Bluetooth>=2.2.0; sys_platform=="win32"
+winrt-Windows.Devices.Enumeration>=2.2.0; sys_platform=="win32"
+winrt-Windows.Foundation>=2.2.0; sys_platform=="win32"
+winrt-Windows.Storage.Streams>=2.2.0; sys_platform=="win32"

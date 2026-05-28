@@ -22,6 +22,7 @@ echo [3/3] Compilation en .exe sans fenetre...
 pyinstaller --onefile --noconsole --name RazerBattery ^
     --hidden-import razer_hid ^
     --collect-all cryptography ^
+    --collect-all winrt ^
     server.py
 if errorlevel 1 ( echo [ERREUR] Compilation echouee. & pause & exit /b 1 )
 
