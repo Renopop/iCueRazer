@@ -4,8 +4,6 @@ Compatible Razer Synapse 3 : hidapi ouvre les devices en accès partagé
 (FILE_SHARE_READ|FILE_SHARE_WRITE) — Synapse continue de fonctionner normalement.
 
 Protocole Razer propriétaire 90 octets.
-On essaie deux variantes de transaction_id et deux commandes batterie
-pour couvrir toutes les générations de produits Synapse 3.
 """
 import hid
 import time
@@ -14,18 +12,20 @@ RAZER_VID = 0x1532
 
 # ── Filtre des appareils affichés ────────────────────────────────────────────
 # Seuls les appareils dont le nom contient l'une de ces chaînes (insensible à
-# la casse) sont remontés. Modifie cette liste pour ajouter/retirer un modèle.
+# la casse) sont remontés dans le widget.
 ALLOWED_DEVICES = [
     'blackwidow v3 mini',
     'kraken v3 pro',
     'cobra pro',
+    'cobra',        # fallback si le dongle du Cobra Pro reporte un nom court
 ]
 
 def _is_allowed(name: str) -> bool:
     n = name.lower()
-    return any(allowed in n for allowed in ALLOWED_DEVICES)
+    return any(kw in n for kw in ALLOWED_DEVICES)
 
 
+# ── Classification par type ──────────────────────────────────────────────────
 _TYPE_KEYWORDS = {
     'mouse': [
         'mouse', 'deathadder', 'viper', 'basilisk', 'mamba', 'naga',
@@ -69,59 +69,55 @@ def _build_report(transaction_id: int, cmd_class: int, cmd_id: int,
     return bytes(buf)
 
 
-# Variantes à essayer par ordre de priorité.
-# Couvre : Deathadder V2/V3, Viper V2, Basilisk V3, BlackWidow V3/V4,
-#           Huntsman V2/V3, Kraken V3/V4, Barracuda, Cobra…
+# Variantes à essayer : (transaction_id, cmd_class, cmd_id)
+# Couvre BlackWidow V3 Mini, Kraken V3 Pro, Cobra Pro et toutes
+# les générations de produits Synapse 3 (2019-2024).
 _VARIANTS = [
-    (0xFF, 0x07, 0x80),   # protocole standard – majorité des Synapse 3
-    (0x1F, 0x07, 0x80),   # certains modèles 2021-2023
-    (0xFF, 0x07, 0x02),   # anciens firmware
-    (0x1F, 0x07, 0x02),
+    (0x1F, 0x07, 0x80),   # Cobra Pro, BlackWidow V3 Mini, modèles 2021-2024
+    (0xFF, 0x07, 0x80),   # Kraken V3 Pro, majorité des Synapse 3
+    (0x1F, 0x07, 0x02),   # variante firmware alternatif
+    (0xFF, 0x07, 0x02),
 ]
 
 
 def _try_read_battery(path: bytes) -> dict | None:
     """
     Tente de lire la batterie depuis un chemin d'interface HID.
-    Essaie plusieurs variantes de commande pour la compatibilité Synapse 3.
-    Retourne {'percent': int, 'charging': bool} ou None si non supporté.
 
-    Réponse sur 91 octets (report-ID inclus) :
-      resp[0]  = report-ID (0x00)
-      resp[1]  = status   (0x02 succès, 0x01 busy-but-valid, 0x04 timeout)
-      resp[2]  = transaction_id  ← validé pour confirmer que c'est notre réponse
-      resp[9]  = args[0] = état de charge (0x01 = en charge)
-      resp[10] = args[1] = niveau batterie brut 0–255
+    Structure de la réponse (91 octets, report-ID en tête) :
+      resp[0]  = report-ID 0x00  (ajouté par hidapi sur Windows)
+      resp[1]  = status          0x02 succès | 0x01 busy-mais-valide
+      resp[9]  = charging        0x01 = en charge
+      resp[10] = battery raw     0–255  →  /255*100 = %
+
+    Note : on ne vérifie PAS resp[2] (transaction_id) car Synapse 3
+    peut le modifier dans sa réponse.
     """
     dev = hid.device()
     try:
         dev.open_path(path)
-        time.sleep(0.05)   # laisse Synapse finir une transaction en cours
+        time.sleep(0.05)
 
         for (tid, cls_, cid) in _VARIANTS:
             try:
                 report = _build_report(tid, cls_, cid, (0x01,))
                 dev.send_feature_report(b'\x00' + report)
-                time.sleep(0.25)                      # 250 ms (Synapse peut être lent)
+                time.sleep(0.25)
                 resp = dev.get_feature_report(0x00, 91)
 
                 if len(resp) < 11:
                     continue
 
                 status = resp[1]
-                # 0x02 = succès, 0x01 = busy (données souvent valides quand même)
-                # 0x00 / 0x04 / 0x05 = pas de données exploitables
+                # Accepter 0x02 (succès) et 0x01 (busy, données souvent valides)
                 if status not in (0x01, 0x02):
                     continue
 
-                # Valider le transaction_id pour éviter de lire une réponse Synapse
-                if resp[2] != tid:
-                    continue
+                raw = resp[10]
+                if raw == 0:
+                    continue   # réponse vide, on essaie la variante suivante
 
                 charging = (resp[9] == 0x01)
-                raw      = resp[10]            # 0–255
-                if raw == 0 and status != 0x02:
-                    continue                   # données probablement parasites
                 percent  = min(100, max(0, round(raw / 255 * 100)))
                 return {'percent': percent, 'charging': charging}
 
@@ -141,9 +137,10 @@ def _try_read_battery(path: bytes) -> dict | None:
 
 def get_all_devices() -> list[dict]:
     """
-    Énumère tous les appareils Razer et lit leur batterie.
-    Synapse 3 peut être actif en parallèle : hidapi utilise FILE_SHARE_*.
-    Un appareil expose souvent plusieurs interfaces HID ; on les essaie toutes.
+    Énumère tous les appareils Razer, filtre selon ALLOWED_DEVICES,
+    et lit la batterie de chacun.
+    Un appareil expose plusieurs interfaces HID ; on les essaie toutes
+    par ordre d'interface_number (interface 0 = principale en général).
     """
     result: list[dict] = []
     try:
@@ -158,17 +155,13 @@ def get_all_devices() -> list[dict]:
         by_pid.setdefault(pid, []).append(iface)
 
     for pid, ifaces in by_pid.items():
-        name  = ifaces[0].get('product_string') or f'Razer 0x{pid:04X}'
+        name = ifaces[0].get('product_string') or f'Razer 0x{pid:04X}'
         if not _is_allowed(name):
             continue
         dtype = _device_type(name)
 
-        # Priorité : interface Usage Page 0x0001 (Generic Desktop) d'abord,
-        # puis les interfaces vendor-defined (0xFF00+), car Synapse 3 peut
-        # monopoliser certaines interfaces vendor — on tente quand même toutes.
-        ordered = sorted(ifaces, key=lambda x: (
-            0 if x.get('usage_page', 0) == 0x0001 else 1
-        ))
+        # Trier par numéro d'interface (0 en premier = interface principale)
+        ordered = sorted(ifaces, key=lambda x: x.get('interface_number', 99))
 
         battery = None
         for iface in ordered:
@@ -180,7 +173,7 @@ def get_all_devices() -> list[dict]:
         if battery:
             entry.update(battery)
         else:
-            entry['wired'] = True  # filaire OU protocole non supporté
+            entry['wired'] = True
 
         result.append(entry)
 
