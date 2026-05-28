@@ -265,14 +265,11 @@ def api_battery_debug():
         buf[88] = crc
         return bytes(buf)
 
+    # 3 variantes suffisent pour le diagnostic — délai réduit à 0.08s
     VARIANTS = [
-        ('tid=0xFF cmd=0x07/0x80 args=()',      0xFF, 0x07, 0x80, ()),
-        ('tid=0xFF cmd=0x07/0x80 args=(0x01,)', 0xFF, 0x07, 0x80, (0x01,)),
-        ('tid=0x1F cmd=0x07/0x80 args=()',      0x1F, 0x07, 0x80, ()),
-        ('tid=0x1F cmd=0x07/0x80 args=(0x01,)', 0x1F, 0x07, 0x80, (0x01,)),
-        ('tid=0x3F cmd=0x07/0x80 args=()',      0x3F, 0x07, 0x80, ()),
-        ('tid=0xFF cmd=0x07/0x02 args=()',      0xFF, 0x07, 0x02, ()),
-        ('tid=0xFF cmd=0x07/0x02 args=(0x01,)', 0xFF, 0x07, 0x02, (0x01,)),
+        ('tid=0xFF/0x80', 0xFF, 0x07, 0x80, ()),
+        ('tid=0x1F/0x80', 0x1F, 0x07, 0x80, ()),
+        ('tid=0xFF/0x02', 0xFF, 0x07, 0x02, ()),
     ]
 
     hid_results = []
@@ -286,24 +283,23 @@ def api_battery_debug():
         pid  = iface['product_id']
         path = iface['path']
         entry = {
-            'pid':       hex(pid),
-            'name':      iface.get('product_string') or f'Razer 0x{pid:04X}',
+            'pid':        hex(pid),
+            'name':       iface.get('product_string') or f'Razer 0x{pid:04X}',
             'usage_page': hex(iface.get('usage_page', 0)),
-            'interface': iface.get('interface_number', -1),
-            'variants':  [],
+            'interface':  iface.get('interface_number', -1),
+            'variants':   [],
         }
         dev = hid.device()
         try:
             dev.open_path(path)
-            time.sleep(0.05)
+            time.sleep(0.02)
             for label, tid, cls_, cid, args in VARIANTS:
                 try:
                     dev.send_feature_report(b'\x00' + _build(tid, cls_, cid, args))
-                    time.sleep(0.3)
+                    time.sleep(0.08)
                     resp = dev.get_feature_report(0x00, 91)
                     entry['variants'].append({
                         'variant':       label,
-                        'resp_len':      len(resp),
                         'bytes_0_15':    list(resp[:16]),
                         'status_byte':   hex(resp[1]) if len(resp) > 1 else None,
                         'charging_byte': resp[9]  if len(resp) > 9  else None,
