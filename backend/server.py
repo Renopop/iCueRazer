@@ -240,6 +240,125 @@ def api_debug():
     return jsonify({'razer_devices_found': len(devices), 'devices': devices})
 
 
+@app.route('/api/battery_debug')
+def api_battery_debug():
+    """
+    Diagnostic batterie : teste chaque interface HID Razer avec plusieurs
+    variantes de commande et affiche les octets bruts reçus.
+    Aussi : lit System.Devices.BatteryStrengthPercent pour les appareils BT.
+    """
+    import hid, sys
+
+    RAZER_VID = 0x1532
+
+    def _build(tid, cmd_class, cmd_id, args=()):
+        buf = bytearray(90)
+        buf[1] = tid
+        buf[5] = len(args) + 2
+        buf[6] = cmd_class
+        buf[7] = cmd_id
+        for i, a in enumerate(args):
+            buf[8 + i] = a
+        crc = 0
+        for b in buf[2:88]:
+            crc ^= b
+        buf[88] = crc
+        return bytes(buf)
+
+    VARIANTS = [
+        ('tid=0xFF cmd=0x07/0x80 args=()',      0xFF, 0x07, 0x80, ()),
+        ('tid=0xFF cmd=0x07/0x80 args=(0x01,)', 0xFF, 0x07, 0x80, (0x01,)),
+        ('tid=0x1F cmd=0x07/0x80 args=()',      0x1F, 0x07, 0x80, ()),
+        ('tid=0x1F cmd=0x07/0x80 args=(0x01,)', 0x1F, 0x07, 0x80, (0x01,)),
+        ('tid=0x3F cmd=0x07/0x80 args=()',      0x3F, 0x07, 0x80, ()),
+        ('tid=0xFF cmd=0x07/0x02 args=()',      0xFF, 0x07, 0x02, ()),
+        ('tid=0xFF cmd=0x07/0x02 args=(0x01,)', 0xFF, 0x07, 0x02, (0x01,)),
+    ]
+
+    hid_results = []
+    try:
+        all_ifaces = hid.enumerate(RAZER_VID)
+    except Exception as e:
+        all_ifaces = []
+        hid_results.append({'error': str(e)})
+
+    for iface in all_ifaces:
+        pid  = iface['product_id']
+        path = iface['path']
+        entry = {
+            'pid':       hex(pid),
+            'name':      iface.get('product_string') or f'Razer 0x{pid:04X}',
+            'usage_page': hex(iface.get('usage_page', 0)),
+            'interface': iface.get('interface_number', -1),
+            'variants':  [],
+        }
+        dev = hid.device()
+        try:
+            dev.open_path(path)
+            time.sleep(0.05)
+            for label, tid, cls_, cid, args in VARIANTS:
+                try:
+                    dev.send_feature_report(b'\x00' + _build(tid, cls_, cid, args))
+                    time.sleep(0.3)
+                    resp = dev.get_feature_report(0x00, 91)
+                    entry['variants'].append({
+                        'variant':       label,
+                        'resp_len':      len(resp),
+                        'bytes_0_15':    list(resp[:16]),
+                        'status_byte':   hex(resp[1]) if len(resp) > 1 else None,
+                        'charging_byte': resp[9]  if len(resp) > 9  else None,
+                        'battery_byte':  resp[10] if len(resp) > 10 else None,
+                    })
+                except Exception as ex:
+                    entry['variants'].append({'variant': label, 'error': str(ex)})
+        except Exception as ex:
+            entry['open_error'] = str(ex)
+        finally:
+            try:
+                dev.close()
+            except Exception:
+                pass
+        hid_results.append(entry)
+
+    # ── Bluetooth : System.Devices.BatteryStrengthPercent ────────────────────
+    bt_results: list = []
+    if sys.platform == 'win32':
+        try:
+            import asyncio
+            from winrt.windows.devices.enumeration import (
+                DeviceInformation, DeviceInformationKind,
+            )
+            BT_PROP = 'System.Devices.BatteryStrengthPercent'
+            AQS = 'System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True'
+
+            async def _bt():
+                out = []
+                try:
+                    devs = await DeviceInformation.find_all_async(
+                        AQS, [BT_PROP], DeviceInformationKind.ASSOCIATION_ENDPOINT,
+                    )
+                except Exception:
+                    devs = await DeviceInformation.find_all_async(AQS, [BT_PROP])
+                for d in devs:
+                    n = d.name or ''
+                    if 'razer' not in n.lower():
+                        continue
+                    try:
+                        raw = d.properties[BT_PROP]
+                    except Exception as ex:
+                        raw = f'error: {ex}'
+                    out.append({'name': n, 'id': str(d.id), BT_PROP: raw})
+                return out
+
+            loop = asyncio.new_event_loop()
+            bt_results = loop.run_until_complete(_bt())
+            loop.close()
+        except Exception as ex:
+            bt_results = [{'error': str(ex)}]
+
+    return jsonify({'hid': hid_results, 'bluetooth': bt_results})
+
+
 # ── Démarrage ────────────────────────────────────────────────────────────────
 def _log(msg: str) -> None:
     """Écrit dans %APPDATA%\RazerBattery\server.log pour le diagnostic."""
