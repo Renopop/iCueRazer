@@ -1,9 +1,7 @@
 """
 Lecture batterie Razer via hidapi.
 Compatible Razer Synapse 3 : hidapi ouvre les devices en accès partagé
-(FILE_SHARE_READ|FILE_SHARE_WRITE) — Synapse continue de fonctionner normalement.
-
-Protocole Razer propriétaire 90 octets.
+(FILE_SHARE_READ|FILE_SHARE_WRITE).
 """
 import hid
 import time
@@ -11,18 +9,26 @@ import time
 RAZER_VID = 0x1532
 
 # ── Filtre des appareils affichés ────────────────────────────────────────────
-# Seuls les appareils dont le nom contient l'une de ces chaînes (insensible à
-# la casse) sont remontés dans le widget.
 ALLOWED_DEVICES = [
     'blackwidow v3 mini',
     'kraken v3 pro',
     'cobra pro',
-    'cobra',        # fallback si le dongle du Cobra Pro reporte un nom court
+    'cobra',        # fallback Cobra Pro dongle
 ]
 
 def _is_allowed(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in ALLOWED_DEVICES)
+
+
+# ── Dongles dont hidapi ne remonte pas le product_string ─────────────────────
+# Razer HyperSpeed dongles exposent un nom vide ; on les identifie par PID.
+KNOWN_DONGLES: dict[int, str] = {
+    0x0271: 'BlackWidow V3 Mini',   # dongle HyperSpeed BlackWidow V3 Mini
+    0x0270: 'BlackWidow V3 Mini',   # variante firmware
+    0x00A3: 'Razer Cobra Pro',      # Cobra Pro HyperSpeed dongle
+    0x00A8: 'Razer Cobra Pro',      # variante
+}
 
 
 # ── Classification par type ──────────────────────────────────────────────────
@@ -34,7 +40,7 @@ _TYPE_KEYWORDS = {
     ],
     'keyboard': [
         'keyboard', 'blackwidow', 'huntsman', 'ornata', 'cynosa',
-        'tartarus', 'deathstalker', 'blade keyboard',
+        'tartarus', 'deathstalker',
     ],
     'headset': [
         'headset', 'kraken', 'barracuda', 'thresher', 'hammerhead',
@@ -55,9 +61,9 @@ def _device_type(name: str) -> str:
 def _build_report(transaction_id: int, cmd_class: int, cmd_id: int,
                   args: tuple = ()) -> bytes:
     buf = bytearray(90)
-    buf[0] = 0x00                  # status: new command
+    buf[0] = 0x00
     buf[1] = transaction_id
-    buf[5] = len(args) + 2         # data_size
+    buf[5] = len(args) + 2
     buf[6] = cmd_class
     buf[7] = cmd_id
     for i, a in enumerate(args):
@@ -69,29 +75,21 @@ def _build_report(transaction_id: int, cmd_class: int, cmd_id: int,
     return bytes(buf)
 
 
-# Variantes à essayer : (transaction_id, cmd_class, cmd_id)
-# Couvre BlackWidow V3 Mini, Kraken V3 Pro, Cobra Pro et toutes
-# les générations de produits Synapse 3 (2019-2024).
+# Variantes : (transaction_id, cmd_class, cmd_id)
 _VARIANTS = [
-    (0x1F, 0x07, 0x80),   # Cobra Pro, BlackWidow V3 Mini, modèles 2021-2024
-    (0xFF, 0x07, 0x80),   # Kraken V3 Pro, majorité des Synapse 3
-    (0x1F, 0x07, 0x02),   # variante firmware alternatif
+    (0x1F, 0x07, 0x80),   # Cobra Pro, BlackWidow V3 Mini, modèles 2021+
+    (0xFF, 0x07, 0x80),   # Kraken V3 Pro et majorité Synapse 3
+    (0x1F, 0x07, 0x02),
     (0xFF, 0x07, 0x02),
 ]
 
 
 def _try_read_battery(path: bytes) -> dict | None:
     """
-    Tente de lire la batterie depuis un chemin d'interface HID.
-
-    Structure de la réponse (91 octets, report-ID en tête) :
-      resp[0]  = report-ID 0x00  (ajouté par hidapi sur Windows)
-      resp[1]  = status          0x02 succès | 0x01 busy-mais-valide
-      resp[9]  = charging        0x01 = en charge
-      resp[10] = battery raw     0–255  →  /255*100 = %
-
-    Note : on ne vérifie PAS resp[2] (transaction_id) car Synapse 3
-    peut le modifier dans sa réponse.
+    Réponse 91 octets (report-ID en tête) :
+      resp[1]  = status  (0x02 succès | 0x01 busy-mais-valide)
+      resp[9]  = charging (0x01 = en charge)
+      resp[10] = battery raw 0–255
     """
     dev = hid.device()
     try:
@@ -107,15 +105,12 @@ def _try_read_battery(path: bytes) -> dict | None:
 
                 if len(resp) < 11:
                     continue
-
-                status = resp[1]
-                # Accepter 0x02 (succès) et 0x01 (busy, données souvent valides)
-                if status not in (0x01, 0x02):
+                if resp[1] not in (0x01, 0x02):
                     continue
 
                 raw = resp[10]
                 if raw == 0:
-                    continue   # réponse vide, on essaie la variante suivante
+                    continue
 
                 charging = (resp[9] == 0x01)
                 percent  = min(100, max(0, round(raw / 255 * 100)))
@@ -137,10 +132,12 @@ def _try_read_battery(path: bytes) -> dict | None:
 
 def get_all_devices() -> list[dict]:
     """
-    Énumère tous les appareils Razer, filtre selon ALLOWED_DEVICES,
-    et lit la batterie de chacun.
-    Un appareil expose plusieurs interfaces HID ; on les essaie toutes
-    par ordre d'interface_number (interface 0 = principale en général).
+    Énumère les appareils Razer, filtre selon ALLOWED_DEVICES, lit la batterie.
+
+    Ordre des interfaces essayées pour la batterie :
+      1. usage_page=0x59  (interface propriétaire Razer → battery sur dongles)
+      2. usage_page=0x0001 interface_number=0  (interface principale USB)
+      3. Toutes les autres interfaces
     """
     result: list[dict] = []
     try:
@@ -148,20 +145,39 @@ def get_all_devices() -> list[dict]:
     except Exception:
         return result
 
-    # Regrouper par product_id
     by_pid: dict[int, list] = {}
     for iface in all_ifaces:
         pid = iface['product_id']
         by_pid.setdefault(pid, []).append(iface)
 
+    raw_entries: list[dict] = []
+
     for pid, ifaces in by_pid.items():
-        name = ifaces[0].get('product_string') or f'Razer 0x{pid:04X}'
+        # Résoudre le nom : product_string ou dongle connu ou PID hex
+        name = (ifaces[0].get('product_string')
+                or KNOWN_DONGLES.get(pid)
+                or f'Razer 0x{pid:04X}')
+
         if not _is_allowed(name):
             continue
+
         dtype = _device_type(name)
 
-        # Trier par numéro d'interface (0 en premier = interface principale)
-        ordered = sorted(ifaces, key=lambda x: x.get('interface_number', 99))
+        # Priorité d'interface pour les feature reports batterie :
+        # 0x59 = interface propriétaire Razer (sur dongles HyperSpeed)
+        # interface 0 en usage_page 0x1 = interface principale
+        def iface_priority(x: dict) -> tuple:
+            up = x.get('usage_page', 0)
+            inum = x.get('interface_number', 99)
+            if up == 0x59:
+                return (0, inum)   # propriétaire Razer → priorité max
+            if up == 0x0001 and inum == 0:
+                return (1, inum)   # interface principale USB
+            if up == 0x0001:
+                return (2, inum)
+            return (3, inum)
+
+        ordered = sorted(ifaces, key=iface_priority)
 
         battery = None
         for iface in ordered:
@@ -175,6 +191,14 @@ def get_all_devices() -> list[dict]:
         else:
             entry['wired'] = True
 
-        result.append(entry)
+        raw_entries.append(entry)
 
-    return result
+    # Dédupliquer par nom : si un appareil apparaît via USB et Bluetooth,
+    # garder celui qui a des données de batterie, sinon le premier trouvé.
+    seen: dict[str, dict] = {}
+    for entry in raw_entries:
+        n = entry['name']
+        if n not in seen or 'percent' in entry:
+            seen[n] = entry
+
+    return list(seen.values())
