@@ -168,61 +168,94 @@ def _get_hid_devices() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Canal 2 — Bluetooth LE via WinRT (GATT Battery Service UUID 0x180F)
-# Utilisé pour les appareils BT qui n'apparaissent pas dans hid.enumerate()
+# Canal 2 — Bluetooth universel via WinRT DeviceInformation
+# Couvre : Bluetooth classique (BlackWidow V3 Mini) + BLE (Cobra Pro)
+# Lit la propriété Windows System.Devices.BatteryStrengthPercent que Windows
+# remplit automatiquement depuis les rapports HID ou le profil GATT Battery.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# UUID standard Bluetooth : Battery Service + Battery Level characteristic
+_BT_BATTERY_PROP = 'System.Devices.BatteryStrengthPercent'
+
+# UUID standard GATT Battery Service (fallback BLE si la propriété est vide)
 _BATT_SVC  = '0000180f-0000-1000-8000-00805f9b34fb'
 _BATT_CHAR = '00002a19-0000-1000-8000-00805f9b34fb'
 
 
-async def _get_ble_devices_async() -> list[dict]:
-    """Énumère les appareils Bluetooth LE appairés et lit leur batterie GATT."""
+async def _gatt_battery(device_id: str) -> int | None:
+    """Fallback GATT BAS pour appareils BLE si la propriété Windows est vide."""
     try:
         from winrt.windows.devices.bluetooth import BluetoothLEDevice
         from winrt.windows.devices.bluetooth.genericattributeprofile import (
             GattCommunicationStatus,
         )
-        from winrt.windows.devices.enumeration import DeviceInformation
+        ble = await BluetoothLEDevice.from_id_async(device_id)
+        svc = await ble.get_gatt_services_for_uuid_async(_BATT_SVC)
+        if svc.status != GattCommunicationStatus.SUCCESS or not svc.services:
+            return None
+        ch = await svc.services[0].get_characteristics_for_uuid_async(_BATT_CHAR)
+        if ch.status != GattCommunicationStatus.SUCCESS or not ch.characteristics:
+            return None
+        val = await ch.characteristics[0].read_value_async()
+        if val.status != GattCommunicationStatus.SUCCESS:
+            return None
+        return bytes(val.value)[0]   # 0–100
+    except Exception:
+        return None
+
+
+async def _get_bt_devices_async() -> list[dict]:
+    """
+    Énumère TOUS les appareils Bluetooth appairés (classique + BLE) via
+    DeviceInformation.find_all_async avec le kind AssociationEndpoint.
+    Lit System.Devices.BatteryStrengthPercent (géré par Windows pour les deux
+    types de BT) puis tombe en fallback GATT BAS pour les appareils BLE.
+    """
+    try:
+        from winrt.windows.devices.enumeration import (
+            DeviceInformation, DeviceInformationKind,
+        )
     except ImportError:
         return []
 
-    result: list[dict] = []
+    # AQS : tous les appareils Bluetooth appairés
+    AQS = 'System.Devices.Aep.IsPaired:=System.StructuredQueryType.Boolean#True'
+
     try:
-        selector = BluetoothLEDevice.get_device_selector_from_pairing_state(True)
-        devices  = await DeviceInformation.find_all_async(selector)
+        devices = await DeviceInformation.find_all_async(
+            AQS,
+            [_BT_BATTERY_PROP],
+            DeviceInformationKind.ASSOCIATION_ENDPOINT,
+        )
     except Exception:
-        return []
-
-    for dev_info in devices:
-        name = dev_info.name or ''
-        if 'razer' not in name.lower():
-            continue
-        if not _is_allowed(name):
-            continue
-
-        entry: dict = {
-            'id':   dev_info.id,
-            'name': name,
-            'type': _device_type(name),
-        }
-
         try:
-            ble = await BluetoothLEDevice.from_id_async(dev_info.id)
-            svc_res = await ble.get_gatt_services_for_uuid_async(_BATT_SVC)
-            if svc_res.status == GattCommunicationStatus.SUCCESS and svc_res.services:
-                chr_res = await svc_res.services[0].get_characteristics_for_uuid_async(
-                    _BATT_CHAR
-                )
-                if chr_res.status == GattCommunicationStatus.SUCCESS and chr_res.characteristics:
-                    val_res = await chr_res.characteristics[0].read_value_async()
-                    if val_res.status == GattCommunicationStatus.SUCCESS:
-                        percent = bytes(val_res.value)[0]   # 0–100
-                        entry['percent']  = percent
-                        entry['charging'] = False           # BAS ne donne pas l'état de charge
+            # Certaines versions winrt n'exposent pas le paramètre kind
+            devices = await DeviceInformation.find_all_async(AQS, [_BT_BATTERY_PROP])
+        except Exception:
+            return []
+
+    result: list[dict] = []
+    for dev in devices:
+        name = dev.name or ''
+        if 'razer' not in name.lower() or not _is_allowed(name):
+            continue
+
+        entry: dict = {'id': dev.id, 'name': name, 'type': _device_type(name)}
+
+        # 1. Propriété Windows (fonctionne pour BT classique + BLE)
+        try:
+            raw = dev.properties[_BT_BATTERY_PROP]
+            if raw is not None and int(raw) > 0:
+                entry['percent']  = int(raw)
+                entry['charging'] = False
         except Exception:
             pass
+
+        # 2. Fallback GATT BAS (BLE uniquement, si propriété vide)
+        if 'percent' not in entry:
+            pct = await _gatt_battery(dev.id)
+            if pct is not None and pct > 0:
+                entry['percent']  = pct
+                entry['charging'] = False
 
         if 'percent' not in entry:
             entry['wired'] = True
@@ -232,13 +265,13 @@ async def _get_ble_devices_async() -> list[dict]:
     return result
 
 
-def _get_ble_devices() -> list[dict]:
-    """Wrapper synchrone pour _get_ble_devices_async."""
+def _get_bt_devices() -> list[dict]:
+    """Wrapper synchrone pour _get_bt_devices_async."""
     if sys.platform != 'win32':
         return []
     try:
         loop = asyncio.new_event_loop()
-        return loop.run_until_complete(_get_ble_devices_async())
+        return loop.run_until_complete(_get_bt_devices_async())
     except Exception:
         return []
     finally:
@@ -264,7 +297,7 @@ def get_all_devices() -> list[dict]:
         if name not in merged or 'percent' in entry:
             merged[name] = entry
 
-    for entry in _get_ble_devices():
+    for entry in _get_bt_devices():
         name = entry['name']
         if name not in merged or 'percent' in entry:
             merged[name] = entry
