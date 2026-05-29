@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Security.Principal;
 using System.Text;
@@ -13,9 +14,11 @@ namespace VirpilCleanup
     public partial class MainWindow : Window
     {
         private const string VIRPIL_VID = "VID_3344";
+        private static readonly string PnpUtilPath =
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "pnputil.exe");
 
-        private List<USBDevice> virpilDevices = new List<USBDevice>();
-        private readonly StringBuilder logBuffer = new StringBuilder();
+        private List<USBDevice> virpilDevices = new();
+        private readonly StringBuilder logBuffer = new();
 
         public MainWindow()
         {
@@ -24,21 +27,20 @@ namespace VirpilCleanup
 
             if (!IsRunningAsAdmin())
             {
-                Log("✗ ERREUR : L'application doit être lancée en tant qu'Administrateur.");
-                Log("  → Fermez et relancez via LaunchAsAdmin.bat ou clic droit → Exécuter en tant qu'administrateur.");
+                Log("✗ ERREUR : Droits administrateur requis.");
+                Log("  → Lancez via LaunchAsAdmin.bat ou clic droit → Exécuter en tant qu'administrateur.");
                 SetButtonsEnabled(false);
                 return;
             }
 
-            Log("✓ Droits administrateur confirmés.\n");
+            Log("✓ Administrateur confirmé.\n");
             _ = LoadDevicesAsync();
         }
 
         private static bool IsRunningAsAdmin()
         {
-            using var identity = WindowsIdentity.GetCurrent();
-            var principal = new WindowsPrincipal(identity);
-            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+            using var id = WindowsIdentity.GetCurrent();
+            return new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator);
         }
 
         private async void LoadDevices_Click(object sender, RoutedEventArgs e)
@@ -66,21 +68,19 @@ namespace VirpilCleanup
         private async Task LoadDevicesAsync()
         {
             ClearLog();
-            Log($"Recherche des périphériques VIRPIL (Vendor ID {VIRPIL_VID})...");
-            Log("(détecte aussi les appareils déconnectés / non reconnus)\n");
+            Log($"Recherche {VIRPIL_VID} dans le registre...\n");
 
             var found = await Task.Run(ScanRegistry);
             virpilDevices = found;
 
             if (virpilDevices.Count == 0)
             {
-                Log("⚠  Aucun périphérique VIRPIL trouvé dans le registre.");
+                Log("⚠  Aucun périphérique VIRPIL trouvé.");
                 Log("   → Registre déjà propre, ou appareils jamais branchés sur ce PC.");
             }
             else
             {
-                Log($"\n✓ {virpilDevices.Count} instance(s) trouvée(s).");
-                Log("  Cliquez 'Supprimer' pour effacer drivers et entrées de registre.");
+                Log($"\n✓ {virpilDevices.Count} instance(s) trouvée(s). Cliquez 'Supprimer'.");
             }
         }
 
@@ -97,37 +97,26 @@ namespace VirpilCleanup
             {
                 try
                 {
-                    using RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
-                    using RegistryKey? enumKey = hklm.OpenSubKey(regPath);
+                    using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                    using var enumKey = hklm.OpenSubKey(regPath);
                     if (enumKey == null) continue;
 
                     foreach (string vidPidKey in enumKey.GetSubKeyNames())
                     {
-                        if (!vidPidKey.ToUpperInvariant().Contains(VIRPIL_VID))
-                            continue;
+                        if (!vidPidKey.ToUpperInvariant().Contains(VIRPIL_VID)) continue;
 
-                        using RegistryKey? deviceKey = enumKey.OpenSubKey(vidPidKey);
+                        using var deviceKey = enumKey.OpenSubKey(vidPidKey);
                         if (deviceKey == null) continue;
 
                         foreach (string instanceId in deviceKey.GetSubKeyNames())
                         {
-                            using RegistryKey? instanceKey = deviceKey.OpenSubKey(instanceId);
-
+                            using var instanceKey = deviceKey.OpenSubKey(instanceId);
                             string name = instanceKey?.GetValue("FriendlyName")?.ToString()
                                        ?? instanceKey?.GetValue("DeviceDesc")?.ToString()
-                                       ?? "(Périphérique inconnu / non reconnu)";
+                                       ?? "(non reconnu)";
 
-                            // Format PnP complet attendu par Remove-PnpDevice et pnputil
-                            // ex: "USB\VID_3344&PID_0101\6&1a2b3c4d&0&1"
                             string pnpId = $@"{bus}\{vidPidKey}\{instanceId}";
-
-                            result.Add(new USBDevice
-                            {
-                                Name = name,
-                                PnpInstanceId = pnpId,
-                                Bus = bus
-                            });
-
+                            result.Add(new USBDevice { Name = name, PnpInstanceId = pnpId, Bus = bus });
                             Log($"  [{bus}] {name}");
                             Log($"         {pnpId}");
                         }
@@ -148,142 +137,90 @@ namespace VirpilCleanup
         {
             if (virpilDevices.Count == 0)
             {
-                MessageBox.Show(
-                    "Aucun périphérique VIRPIL dans le registre.\n\nRien à supprimer.",
-                    "Information", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show("Aucun périphérique VIRPIL dans le registre.", "Information",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
             var confirm = MessageBox.Show(
                 $"Supprimer {virpilDevices.Count} instance(s) VIRPIL ?\n\n" +
-                "• Drivers désinstallés\n" +
-                "• Entrées registre supprimées\n\n" +
                 "Redémarrez le PC ensuite, puis rebranchez les contrôleurs.",
                 "Confirmation", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-
-            if (confirm != MessageBoxResult.Yes)
-                return;
+            if (confirm != MessageBoxResult.Yes) return;
 
             ClearLog();
-            Log("=== Suppression VIRPIL (VID_3344) ===\n");
+            Log("=== Suppression VIRPIL ===\n");
 
             var snapshot = virpilDevices.ToList();
 
-            // Étape 1 — Remove-PnpDevice (PowerShell, plus fiable que pnputil)
-            Log("── Étape 1 : Remove-PnpDevice (PowerShell)...\n");
-            await Task.Run(() => RemoveViaPowerShell(snapshot));
+            // Étape 1 : pnputil /remove-device pour chaque instance
+            Log("── Étape 1 : pnputil /remove-device...\n");
+            foreach (var device in snapshot)
+                await RemoveViaPnpUtil(device);
 
-            // Étape 2 — Nettoyage DeviceClasses (interfaces de classe)
-            Log("\n── Étape 2 : Nettoyage DeviceClasses...\n");
+            // Étape 2 : DeviceClasses registry cleanup
+            Log("\n── Étape 2 : nettoyage DeviceClasses...\n");
             int cleaned = await Task.Run(CleanDeviceClasses);
+            Log($"  {cleaned} entrée(s) supprimée(s).");
 
-            Log($"\n✓ {cleaned} entrée(s) DeviceClasses supprimée(s).");
-            Log("\n══════════════════════════════");
-            Log("Étapes suivantes :");
-            Log("  1. Redémarrez le PC");
-            Log("  2. Rebranchez les contrôleurs VIRPIL");
-            Log("  3. Windows réinstalle les drivers");
+            Log("\n══════════════════════════");
+            Log("→ Redémarrez le PC");
+            Log("→ Rebranchez les contrôleurs VIRPIL");
+            Log("→ Windows réinstalle les drivers automatiquement");
 
             await Task.Delay(600);
             await LoadDevicesAsync();
         }
 
-        private void RemoveViaPowerShell(List<USBDevice> devices)
+        private async Task RemoveViaPnpUtil(USBDevice device)
         {
-            Log($"  {devices.Count} instance(s) à supprimer...\n");
+            Log($"  [{device.Bus}] {device.Name}");
+            Log($"    {device.PnpInstanceId}");
 
-            // Script écrit dans un fichier temp pour éviter tout problème d'échappement
-            // Get-PnpDevice cherche par HardwareID directement — plus fiable que les InstanceId
-            string script = @"
-$ErrorActionPreference = 'Continue'
+            // BUG CLASSIQUE : lire stdout ET stderr en parallèle (async).
+            // Si on lit l'un puis l'autre séquentiellement, le buffer de l'un
+            // se remplit pendant qu'on attend l'autre → deadlock permanent.
+            var (stdout, stderr, exitCode) = await RunProcessAsync(
+                PnpUtilPath,
+                $"/remove-device \"{device.PnpInstanceId}\" /uninstall");
 
-# Chercher tous les périphériques VIRPIL (connectés + ghosts déconnectés)
-$all = Get-PnpDevice | Where-Object { $_.HardwareID -match 'VID_3344' }
+            foreach (var line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                Log($"    {line.TrimEnd()}");
 
-if ($all.Count -eq 0) {
-    Write-Output 'AUCUN peripherique VID_3344 trouve via Get-PnpDevice'
-    exit 0
-}
+            if (!string.IsNullOrWhiteSpace(stderr))
+                Log($"    ⚠ stderr: {stderr.Trim()}");
 
-Write-Output ""Trouvé $($all.Count) périphérique(s) VID_3344""
-
-foreach ($dev in $all) {
-    $label = if ($dev.FriendlyName) { $dev.FriendlyName } else { $dev.InstanceId }
-    Write-Output ""  Suppression: $label""
-    try {
-        Remove-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
-        Write-Output ""    OK""
-    } catch {
-        Write-Output ""    ERREUR: $($_.Exception.Message)""
-    }
-}
-
-Write-Output 'Terminé.'
-";
-
-            string tempFile = System.IO.Path.Combine(
-                System.IO.Path.GetTempPath(),
-                "virpil_remove.ps1");
-
-            try
-            {
-                System.IO.File.WriteAllText(tempFile, script, System.Text.Encoding.UTF8);
-                RunPowerShellFile(tempFile);
-            }
-            finally
-            {
-                try { System.IO.File.Delete(tempFile); } catch { }
-            }
+            Log(exitCode == 0 ? "    ✓ OK" : $"    ⚠ Code retour: {exitCode}");
+            Log("");
         }
 
-        private void RunPowerShellFile(string scriptPath)
+        // Lecture stdout + stderr en parallèle pour éviter le deadlock
+        private static async Task<(string Stdout, string Stderr, int ExitCode)> RunProcessAsync(
+            string fileName, string arguments)
         {
-            try
+            var psi = new ProcessStartInfo
             {
-                string psExe = System.IO.Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.System),
-                    "WindowsPowerShell", "v1.0", "powershell.exe");
+                FileName = fileName,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
 
-                if (!System.IO.File.Exists(psExe))
-                    psExe = "powershell.exe";
+            using var proc = Process.Start(psi)!;
 
-                var psi = new ProcessStartInfo
-                {
-                    FileName = psExe,
-                    // -File (pas -Command) : pas d'échappement, supporte les scripts longs
-                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
+            // Lecture simultanée indispensable — ne jamais faire ReadToEnd() l'un après l'autre
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            var stderrTask = proc.StandardError.ReadToEndAsync();
+            await Task.WhenAll(stdoutTask, stderrTask);
+            await proc.WaitForExitAsync();
 
-                using Process proc = Process.Start(psi)!;
-                string stdout = proc.StandardOutput.ReadToEnd();
-                string stderr = proc.StandardError.ReadToEnd();
-                proc.WaitForExit();
-
-                foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                    Log($"  {line.TrimEnd()}");
-
-                if (!string.IsNullOrWhiteSpace(stderr))
-                {
-                    Log("  ── Erreurs PowerShell ──");
-                    foreach (string line in stderr.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                        Log($"  ⚠  {line.TrimEnd()}");
-                }
-
-                Log($"\n  [Code retour PowerShell: {proc.ExitCode}]");
-            }
-            catch (Exception ex)
-            {
-                Log($"  ✗ Impossible de lancer PowerShell: {ex.Message}");
-            }
+            return (stdoutTask.Result, stderrTask.Result, proc.ExitCode);
         }
 
-        // DeviceClasses : interfaces de classe HID/USB
-        // Structure : HKLM\...\DeviceClasses\{GUID}\##?#USB#VID_3344&PID_xxxx#...
-        // Ces clés sont accessibles en écriture avec droits admin
+        // ── DEVICE CLASSES CLEANUP ────────────────────────────────────────
+
         private int CleanDeviceClasses()
         {
             int count = 0;
@@ -291,42 +228,35 @@ Write-Output 'Terminé.'
 
             try
             {
-                using RegistryKey hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
-                using RegistryKey? dcKey = hklm.OpenSubKey(dcPath);
+                using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                using var dcKey = hklm.OpenSubKey(dcPath);
                 if (dcKey == null) return 0;
 
                 foreach (string classGuid in dcKey.GetSubKeyNames())
                 {
                     try
                     {
-                        using RegistryKey? classKey = hklm.OpenSubKey($@"{dcPath}\{classGuid}", writable: true);
+                        using var classKey = hklm.OpenSubKey($@"{dcPath}\{classGuid}", writable: true);
                         if (classKey == null) continue;
 
-                        var toDelete = classKey.GetSubKeyNames()
+                        foreach (string entry in classKey.GetSubKeyNames()
                             .Where(k => k.ToUpperInvariant().Contains(VIRPIL_VID))
-                            .ToList();
-
-                        foreach (string entry in toDelete)
+                            .ToList())
                         {
                             try
                             {
                                 classKey.DeleteSubKeyTree(entry, throwOnMissingSubKey: false);
-                                Log($"  ✓ Supprimé: DeviceClasses\\{classGuid}\\{entry[..Math.Min(entry.Length, 60)]}...");
+                                string shortEntry = entry.Length > 60 ? entry[..60] + "…" : entry;
+                                Log($"  ✓ DeviceClasses\\{classGuid[..8]}...\\{shortEntry}");
                                 count++;
                             }
-                            catch (Exception ex)
-                            {
-                                Log($"  ⚠  {entry[..Math.Min(entry.Length, 40)]}... : {ex.Message}");
-                            }
+                            catch (Exception ex) { Log($"  ⚠ {ex.Message}"); }
                         }
                     }
                     catch { }
                 }
             }
-            catch (Exception ex)
-            {
-                Log($"  ⚠  Erreur DeviceClasses: {ex.Message}");
-            }
+            catch (Exception ex) { Log($"  ⚠ DeviceClasses: {ex.Message}"); }
 
             return count;
         }
