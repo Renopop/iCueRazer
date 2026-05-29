@@ -98,10 +98,12 @@ namespace VirpilCleanup
         {
             var result = new List<string>();
 
-            // Lancer pnputil /enum-devices /ids
-            // /ids : affiche les Hardware IDs (contiennent VID_3344)
-            // sans /connected ni /disconnected = tous appareils (branches + ghosts)
-            string rawOutput = RunProcessSync(PnpUtil, "/enum-devices /ids");
+            // Deux passes :
+            //   1) sans filtre    = appareils actuellement branches
+            //   2) /disconnected  = appareils fantomes (ghost devices, non branches mais encore dans le registre)
+            // On fusionne les deux pour tout trouver
+            string rawOutput = RunProcessSync(PnpUtil, "/enum-devices /ids") + "\n"
+                             + RunProcessSync(PnpUtil, "/enum-devices /ids /disconnected");
 
             Log("--- Sortie brute de pnputil ---");
             // On montre uniquement les lignes pertinentes pour ne pas surcharger
