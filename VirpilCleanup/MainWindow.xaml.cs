@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Principal;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.Win32;
@@ -14,11 +16,21 @@ namespace VirpilCleanup
     public partial class MainWindow : Window
     {
         private const string VIRPIL_VID = "VID_3344";
+        private const int PROCESS_TIMEOUT_MS = 30_000;
+
         private static readonly string PnpUtil =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "pnputil.exe");
 
-        // IDs exacts tels que rapportés par pnputil lui-même
+        // pnputil est un exe Win32 console : il écrit en OEM (CP850 sur FR, CP437 sur EN)
+        // Forcer UTF-8 corrompt les caractères et peut casser les instance IDs
+        private static readonly Encoding OemEncoding =
+            Encoding.GetEncoding(CultureInfo.InstalledUICulture.TextInfo.OEMCodePage);
+
         private List<string> foundInstanceIds = new();
+
+        // Lock pour protéger logBuffer : Log() est appelé depuis Task.Run (threads background)
+        // StringBuilder n'est pas thread-safe — sans lock, ToString() peut corrompre la mémoire
+        private readonly object logLock = new();
         private readonly StringBuilder logBuffer = new();
 
         public MainWindow()
@@ -29,7 +41,7 @@ namespace VirpilCleanup
             if (!IsRunningAsAdmin())
             {
                 Log("ERREUR : droits administrateur requis.");
-                Log("Relancez via LaunchAsAdmin.bat ou clic droit -> Exécuter en tant qu'administrateur.");
+                Log("Relancez via LaunchAsAdmin.bat ou clic droit -> Executer en tant qu'administrateur.");
                 SetButtonsEnabled(false);
                 return;
             }
@@ -47,15 +59,15 @@ namespace VirpilCleanup
         private async void LoadDevices_Click(object sender, RoutedEventArgs e)
         {
             SetButtonsEnabled(false);
-            await ScanAsync();
-            SetButtonsEnabled(true);
+            try   { await ScanAsync(); }
+            finally { SetButtonsEnabled(true); }   // toujours réactivé même si exception
         }
 
         private async void RemoveDevices_Click(object sender, RoutedEventArgs e)
         {
             SetButtonsEnabled(false);
-            await RemoveAsync();
-            SetButtonsEnabled(true);
+            try   { await RemoveAsync(); }
+            finally { SetButtonsEnabled(true); }   // toujours réactivé même si exception
         }
 
         private void SetButtonsEnabled(bool enabled)
@@ -65,71 +77,79 @@ namespace VirpilCleanup
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // SCAN : pnputil énumère tous les appareils, on filtre VID_3344
-        // On utilise pnputil /enum-devices /ids pour avoir les Instance IDs
-        // exacts que pnputil utilise en interne (pas le registre directement)
+        // SCAN  –  deux passes pnputil indépendantes, résultats fusionnés
         // ─────────────────────────────────────────────────────────────────
 
         private async Task ScanAsync()
         {
             ClearLog();
-            Log($"--- Recherche des périphériques VIRPIL (VID_3344) ---\n");
-            Log($"Outil  : {PnpUtil}");
-            Log($"Commande: pnputil /enum-devices /ids\n");
+            Log($"--- Recherche VIRPIL ({VIRPIL_VID}) ---\n");
+            Log($"Outil : {PnpUtil}\n");
 
             var ids = await Task.Run(FindVirpilInstanceIds);
             foundInstanceIds = ids;
 
             if (foundInstanceIds.Count == 0)
             {
-                Log("=> Aucun périphérique VID_3344 trouve.");
-                Log("   Le registre est deja propre, ou les appareils n'ont jamais ete branches.");
+                Log("=> Aucun peripherique VID_3344 trouve.");
+                Log("   Registre deja propre, ou appareils jamais branches.");
             }
             else
             {
-                Log($"=> {foundInstanceIds.Count} instance(s) trouvee(s) :\n");
+                Log($"=> {foundInstanceIds.Count} instance(s) :\n");
                 for (int i = 0; i < foundInstanceIds.Count; i++)
                     Log($"  [{i + 1}] {foundInstanceIds[i]}");
-                Log("\nCliquez 'Supprimer' pour les effacer.");
+                Log("\nCliquez 'Supprimer' pour tout effacer.");
             }
         }
 
         private List<string> FindVirpilInstanceIds()
         {
+            // Passe 1 : appareils connectés
+            // Passe 2 : ghosts (non branchés, encore dans le registre)
+            //
+            // BUG CORRIGE : les deux passes sont parsées SÉPARÉMENT puis fusionnées.
+            // Concaténer les deux sorties brutes puis parser d'une traite provoquait
+            // un carry-over d'état entre les passes : si pass1 se terminait avec
+            // isVirpil=true, le premier appareil de pass2 héritait ce flag et était
+            // faussement ajouté à la liste même s'il n'était pas VIRPIL.
+            var pass1 = ParseVirpilIds(RunProcess(PnpUtil, "/enum-devices /ids").Stdout,         "PASSE 1 (connectes)");
+            var pass2 = ParseVirpilIds(RunProcess(PnpUtil, "/enum-devices /ids /disconnected").Stdout, "PASSE 2 (ghosts)");
+
+            // Déduplication : un appareil connecté peut apparaître dans les deux passes
+            return pass1.Concat(pass2).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        private List<string> ParseVirpilIds(string pnputilStdout, string passLabel)
+        {
             var result = new List<string>();
 
-            // Deux passes :
-            //   1) sans filtre    = appareils actuellement branches
-            //   2) /disconnected  = appareils fantomes (ghost devices, non branches mais encore dans le registre)
-            // On fusionne les deux pour tout trouver
-            string rawOutput = RunProcessSync(PnpUtil, "/enum-devices /ids") + "\n"
-                             + RunProcessSync(PnpUtil, "/enum-devices /ids /disconnected");
-
-            Log("--- Sortie brute de pnputil ---");
-            // On montre uniquement les lignes pertinentes pour ne pas surcharger
-            foreach (var line in rawOutput.Split('\n'))
+            Log($"--- {passLabel} ---");
+            foreach (var line in pnputilStdout.Split('\n'))
             {
                 string t = line.Trim();
-                if (t.StartsWith("Instance ID:") || t.ToUpperInvariant().Contains(VIRPIL_VID))
+                if (t.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase)
+                    || t.ToUpperInvariant().Contains(VIRPIL_VID))
                     Log($"  {t}");
             }
-            Log("--- Fin sortie pnputil ---\n");
+            Log("");
 
-            // Parser : on cherche les blocs "Instance ID:" dont les Hardware IDs contiennent VID_3344
             string? currentId = null;
             bool isVirpil = false;
 
-            foreach (string rawLine in rawOutput.Split('\n'))
+            foreach (string rawLine in pnputilStdout.Split('\n'))
             {
                 string line = rawLine.Trim();
 
                 if (line.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Sauvegarder le precedent si c'etait VIRPIL
-                    if (currentId != null && isVirpil && !result.Contains(currentId))
+                    if (currentId != null && isVirpil)
                         result.Add(currentId);
 
-                    currentId = line.Substring(line.IndexOf(':') + 1).Trim();
+                    // BUG CORRIGE : utiliser la longueur du préfixe, pas IndexOf(':')
+                    // IndexOf(':') trouvait le bon ':' par hasard ; sur certaines locales
+                    // "Instance ID : value" (colon avec espace) pouvait décaler l'extraction
+                    currentId = line.Substring("Instance ID:".Length).Trim();
                     isVirpil = false;
                 }
                 else if (line.ToUpperInvariant().Contains(VIRPIL_VID))
@@ -137,30 +157,29 @@ namespace VirpilCleanup
                     isVirpil = true;
                 }
             }
-            // Dernier bloc
-            if (currentId != null && isVirpil && !result.Contains(currentId))
+            if (currentId != null && isVirpil)
                 result.Add(currentId);
 
             return result;
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // SUPPRESSION : un par un, sortie complete affichee pour chaque
+        // SUPPRESSION  –  un par un, sortie complète affichée
         // ─────────────────────────────────────────────────────────────────
 
         private async Task RemoveAsync()
         {
             if (foundInstanceIds.Count == 0)
             {
-                MessageBox.Show("Aucun peripherique VIRPIL trouve. Rien a supprimer.",
-                    "Info", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show("Aucun peripherique VIRPIL trouve.", "Info",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
             var confirm = MessageBox.Show(
                 $"Supprimer {foundInstanceIds.Count} instance(s) VIRPIL ?\n\n" +
-                "Apres suppression, DEBRANCHEZ immediatement les\n" +
-                "controleurs pour eviter que Windows les reenumere.\n\n" +
+                "Apres la suppression, DEBRANCHEZ immediatement\n" +
+                "les controleurs (sinon Windows les reenumere).\n\n" +
                 "Redemarrez le PC ensuite.",
                 "Confirmation", MessageBoxButton.YesNo, MessageBoxImage.Warning);
 
@@ -169,54 +188,61 @@ namespace VirpilCleanup
             ClearLog();
             Log($"=== SUPPRESSION {foundInstanceIds.Count} instance(s) VIRPIL ===\n");
 
-            int ok = 0;
-            int fail = 0;
+            int ok = 0, fail = 0;
+            var snapshot = foundInstanceIds.ToList();
 
-            for (int i = 0; i < foundInstanceIds.Count; i++)
+            for (int i = 0; i < snapshot.Count; i++)
             {
-                string instanceId = foundInstanceIds[i];
-                Log($"[{i + 1}/{foundInstanceIds.Count}] {instanceId}");
+                string instanceId = snapshot[i];
+                Log($"[{i + 1}/{snapshot.Count}] {instanceId}");
 
                 string args = $"/remove-device \"{instanceId}\" /uninstall";
-                Log($"  Commande: pnputil {args}");
+                Log($"  pnputil {args}");
 
-                // Executer et afficher TOUTE la sortie
-                string output = await Task.Run(() => RunProcessSync(PnpUtil, args));
+                var r = await Task.Run(() => RunProcess(PnpUtil, args));
 
-                foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                foreach (var line in r.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
                     Log($"  {line.TrimEnd()}");
 
-                // pnputil retourne 0 si succes
-                bool success = output.ToUpperInvariant().Contains("OK") ||
-                               output.ToUpperInvariant().Contains("SUCCESS") ||
-                               output.ToUpperInvariant().Contains("REUSSI") ||
-                               !output.ToUpperInvariant().Contains("ECHEC") &&
-                               !output.ToUpperInvariant().Contains("FAILED") &&
-                               !output.ToUpperInvariant().Contains("ERROR");
+                if (!string.IsNullOrWhiteSpace(r.Stderr))
+                    foreach (var line in r.Stderr.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                        Log($"  [ERR] {line.TrimEnd()}");
 
-                if (success) ok++; else fail++;
+                if (r.TimedOut)
+                {
+                    Log($"  TIMEOUT ({PROCESS_TIMEOUT_MS / 1000}s) - pnputil ne repond pas");
+                    fail++;
+                }
+                else
+                {
+                    // BUG CORRIGE : succès déterminé par le code de retour réel de pnputil
+                    // L'ancienne heuristique par string matching (OK/SUCCESS/ERROR…) avait
+                    // un bug de précédence &&/|| et considérait presque tout comme succès
+                    Log($"  Code retour : {r.ExitCode}");
+                    if (r.ExitCode == 0) ok++; else fail++;
+                }
                 Log("");
             }
 
-            // Nettoyage DeviceClasses
-            Log("\n--- Nettoyage DeviceClasses (entrees restantes) ---\n");
+            Log("\n--- Nettoyage DeviceClasses ---\n");
             int cleaned = await Task.Run(CleanDeviceClasses);
             Log($"{cleaned} entree(s) DeviceClasses supprimee(s).\n");
 
-            Log($"=== TERMINE : {ok} OK / {fail} echec(s) ===");
+            Log($"=== TERMINE : {ok} OK  /  {fail} echec(s) ===");
             Log("\n!!! DEBRANCHEZ VOS CONTROLEURS VIRPIL MAINTENANT !!!");
-            Log("Puis redemarrez le PC, et rebranchez pour reinstaller.");
+            Log("Puis redemarrez le PC et rebranchez pour reinstaller.");
 
-            // Rescan pour confirmer
             await Task.Delay(1500);
             await ScanAsync();
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // PROCESS : lecture stdout+stderr en parallele (evite deadlock)
+        // PROCESS  –  threads séparés stdout/stderr, timeout 30s
         // ─────────────────────────────────────────────────────────────────
 
-        private static string RunProcessSync(string fileName, string arguments)
+        private record ProcessResult(string Stdout, string Stderr, int ExitCode, bool TimedOut);
+
+        private static ProcessResult RunProcess(string fileName, string arguments)
         {
             var psi = new ProcessStartInfo
             {
@@ -226,35 +252,37 @@ namespace VirpilCleanup
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
+                StandardOutputEncoding = OemEncoding,
+                StandardErrorEncoding  = OemEncoding,
             };
 
             using var proc = Process.Start(psi)!;
 
-            // Lecture simultanee stdout + stderr pour eviter deadlock
-            // (si buffer stderr plein pendant ReadToEnd(stdout) -> deadlock)
             string stdout = "";
             string stderr = "";
 
-            var stdoutThread = new System.Threading.Thread(() => stdout = proc.StandardOutput.ReadToEnd());
-            var stderrThread = new System.Threading.Thread(() => stderr = proc.StandardError.ReadToEnd());
+            // Deux threads pour lire stdout+stderr simultanément
+            // (ReadToEnd séquentiel → deadlock si buffers pleins)
+            var t1 = new Thread(() => stdout = proc.StandardOutput.ReadToEnd()) { IsBackground = true };
+            var t2 = new Thread(() => stderr = proc.StandardError.ReadToEnd())  { IsBackground = true };
+            t1.Start();
+            t2.Start();
 
-            stdoutThread.Start();
-            stderrThread.Start();
-            proc.WaitForExit();
-            stdoutThread.Join();
-            stderrThread.Join();
+            // Timeout pour éviter un blocage infini si pnputil freeze
+            bool finished = proc.WaitForExit(PROCESS_TIMEOUT_MS);
+            if (!finished)
+            {
+                try { proc.Kill(); } catch { /* déjà mort */ }
+            }
 
-            string combined = stdout;
-            if (!string.IsNullOrWhiteSpace(stderr))
-                combined += "\n[STDERR] " + stderr;
+            t1.Join(5_000);
+            t2.Join(5_000);
 
-            return combined;
+            return new ProcessResult(stdout, stderr, finished ? proc.ExitCode : -1, !finished);
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // DEVICECLASSES : nettoyage registre des interfaces de classe
+        // DEVICECLASSES  –  nettoyage registre
         // ─────────────────────────────────────────────────────────────────
 
         private int CleanDeviceClasses()
@@ -281,7 +309,8 @@ namespace VirpilCleanup
                             try
                             {
                                 classKey.DeleteSubKeyTree(entry, throwOnMissingSubKey: false);
-                                Log($"  OK DeviceClasses\\...\\{(entry.Length > 50 ? entry[..50] + "..." : entry)}");
+                                string label = entry.Length > 50 ? entry[..50] + "..." : entry;
+                                Log($"  OK {classGuid[..8]}...\\{label}");
                                 count++;
                             }
                             catch (Exception ex) { Log($"  FAIL {ex.Message}"); }
@@ -296,22 +325,30 @@ namespace VirpilCleanup
         }
 
         // ─────────────────────────────────────────────────────────────────
-        // LOG
+        // LOG  –  thread-safe (lock sur logBuffer)
         // ─────────────────────────────────────────────────────────────────
 
         private void Log(string message)
         {
-            logBuffer.AppendLine(message);
+            // BUG CORRIGE : StringBuilder n'est pas thread-safe.
+            // Log() est appelé depuis Task.Run() (thread pool) et depuis le thread UI.
+            // Sans lock, ToString() pendant un AppendLine() concurrent corrompt l'état interne.
+            string snapshot;
+            lock (logLock)
+            {
+                logBuffer.AppendLine(message);
+                snapshot = logBuffer.ToString();
+            }
             Dispatcher.BeginInvoke(() =>
             {
-                LogTextBox.Text = logBuffer.ToString();
+                LogTextBox.Text = snapshot;
                 LogTextBox.ScrollToEnd();
             });
         }
 
         private void ClearLog()
         {
-            logBuffer.Clear();
+            lock (logLock) { logBuffer.Clear(); }
             Dispatcher.Invoke(() => LogTextBox.Text = "");
         }
     }
