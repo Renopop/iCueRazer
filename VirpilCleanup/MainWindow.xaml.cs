@@ -186,15 +186,22 @@ namespace VirpilCleanup
             ClearLog();
             Log($"=== SUPPRESSION {foundInstanceIds.Count} instance(s) VIRPIL ===\n");
 
+            // HID enfants en premier, puis USB parents
+            // Supprimer un parent USB avant ses enfants HID peut bloquer la suppression
+            var snapshot = foundInstanceIds
+                .OrderBy(id => id.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+                .ToList();
+
+            Log("Ordre de suppression : HID (enfants) avant USB (parents)\n");
+
             int ok = 0, fail = 0;
-            var snapshot = foundInstanceIds.ToList();
 
             for (int i = 0; i < snapshot.Count; i++)
             {
                 string instanceId = snapshot[i];
                 Log($"[{i + 1}/{snapshot.Count}] {instanceId}");
 
-                string args = $"/remove-device \"{instanceId}\" /uninstall";
+                string args = $"/remove-device \"{instanceId}\" /subtree /uninstall /force";
                 Log($"  pnputil {args}");
 
                 var r = await Task.Run(() => RunProcess(PnpUtil, args));
@@ -213,9 +220,6 @@ namespace VirpilCleanup
                 }
                 else
                 {
-                    // BUG CORRIGE : succès déterminé par le code de retour réel de pnputil
-                    // L'ancienne heuristique par string matching (OK/SUCCESS/ERROR…) avait
-                    // un bug de précédence &&/|| et considérait presque tout comme succès
                     Log($"  Code retour : {r.ExitCode}");
                     if (r.ExitCode == 0) ok++; else fail++;
                 }
@@ -226,11 +230,22 @@ namespace VirpilCleanup
             int cleaned = await Task.Run(CleanDeviceClasses);
             Log($"{cleaned} entree(s) DeviceClasses supprimee(s).\n");
 
-            Log($"=== TERMINE : {ok} OK  /  {fail} echec(s) ===");
-            Log("\n!!! DEBRANCHEZ VOS CONTROLEURS VIRPIL MAINTENANT !!!");
-            Log("Puis redemarrez le PC et rebranchez pour reinstaller.");
+            Log("--- Nettoyage Enum\\USB et Enum\\HID ---\n");
+            int enumCleaned = await Task.Run(CleanEnumRegistry);
+            Log($"{enumCleaned} entree(s) Enum supprimee(s).\n");
 
-            await Task.Delay(1500);
+            Log($"=== TERMINE : {ok} OK  /  {fail} echec(s) ===");
+
+            // Pause obligatoire : Windows reenumere les peripheriques encore branches.
+            // L'utilisateur doit debrancher AVANT qu'on rescanne.
+            MessageBox.Show(
+                $"Suppression terminee : {ok} OK, {fail} echec(s).\n\n" +
+                "DEBRANCHEZ MAINTENANT tous vos controleurs VIRPIL/VPC\n" +
+                "avant de cliquer OK.\n\n" +
+                "Si vous ne les debranchez pas, Windows va les reenumerer\n" +
+                "immediatement et ils reapparaitront dans la liste.",
+                "Action requise", MessageBoxButton.OK, MessageBoxImage.Warning);
+
             await ScanAsync();
         }
 
@@ -316,6 +331,64 @@ namespace VirpilCleanup
                 }
             }
             catch (Exception ex) { Log($"  FAIL DeviceClasses: {ex.Message}"); }
+
+            return count;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // ENUM  –  nettoyage des arbres USB et HID en registre
+        // ─────────────────────────────────────────────────────────────────
+
+        private int CleanEnumRegistry()
+        {
+            int count = 0;
+            const string enumUsbPath = @"SYSTEM\CurrentControlSet\Enum\USB";
+            const string enumHidPath = @"SYSTEM\CurrentControlSet\Enum\HID";
+
+            try
+            {
+                using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                count += CleanEnumPath(hklm, enumUsbPath);
+                count += CleanEnumPath(hklm, enumHidPath);
+            }
+            catch (Exception ex) { Log($"  FAIL CleanEnum: {ex.Message}"); }
+
+            return count;
+        }
+
+        private int CleanEnumPath(RegistryKey hklm, string enumPath)
+        {
+            int count = 0;
+
+            try
+            {
+                using var enumKey = hklm.OpenSubKey(enumPath);
+                if (enumKey == null) return 0;
+
+                foreach (string vendorId in enumKey.GetSubKeyNames().ToList())
+                {
+                    if (!vendorId.ToUpperInvariant().Contains(VIRPIL_VID)) continue;
+
+                    try
+                    {
+                        using var vendorKey = hklm.OpenSubKey($@"{enumPath}\{vendorId}", writable: true);
+                        if (vendorKey == null) continue;
+
+                        foreach (string deviceId in vendorKey.GetSubKeyNames().ToList())
+                        {
+                            try
+                            {
+                                vendorKey.DeleteSubKeyTree(deviceId, throwOnMissingSubKey: false);
+                                Log($"  OK {enumPath[enumPath.LastIndexOf('\\') + 1..]}\\{vendorId}\\{deviceId}");
+                                count++;
+                            }
+                            catch (Exception ex) { Log($"  FAIL {ex.Message}"); }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
 
             return count;
         }
