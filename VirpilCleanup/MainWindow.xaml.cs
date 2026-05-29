@@ -122,7 +122,10 @@ namespace VirpilCleanup
             foreach (var line in pnputilStdout.Split('\n'))
             {
                 string t = line.Trim();
-                if (t.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase)
+                // Chercher le préfixe Instance ID en anglais OU en français (ID d'instance)
+                if ((t.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase) ||
+                     t.StartsWith("ID d'instance :", StringComparison.OrdinalIgnoreCase) ||
+                     t.StartsWith("ID d'instance:", StringComparison.OrdinalIgnoreCase))
                     || t.ToUpperInvariant().Contains(VIRPIL_VID))
                     Log($"  {t}");
             }
@@ -135,15 +138,28 @@ namespace VirpilCleanup
             {
                 string line = rawLine.Trim();
 
+                // Détecter "Instance ID:" (EN) ou "ID d'instance :" (FR)
+                // Chercher le dernier ':' car le préfixe peut varier légèrement
+                bool isInstanceIdLine = false;
+                int colonIdx = -1;
                 if (line.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
+                {
+                    isInstanceIdLine = true;
+                    colonIdx = line.IndexOf(':');
+                }
+                else if (line.StartsWith("ID d'instance:", StringComparison.OrdinalIgnoreCase) ||
+                         line.StartsWith("ID d'instance :", StringComparison.OrdinalIgnoreCase))
+                {
+                    isInstanceIdLine = true;
+                    colonIdx = line.LastIndexOf(':');
+                }
+
+                if (isInstanceIdLine && colonIdx >= 0)
                 {
                     if (currentId != null && isVirpil)
                         result.Add(currentId);
 
-                    // BUG CORRIGE : utiliser la longueur du préfixe, pas IndexOf(':')
-                    // IndexOf(':') trouvait le bon ':' par hasard ; sur certaines locales
-                    // "Instance ID : value" (colon avec espace) pouvait décaler l'extraction
-                    currentId = line.Substring("Instance ID:".Length).Trim();
+                    currentId = line.Substring(colonIdx + 1).Trim();
                     isVirpil = false;
                 }
                 else if (line.ToUpperInvariant().Contains(VIRPIL_VID))
