@@ -115,11 +115,12 @@ namespace VirpilCleanup
             return pass1.Concat(pass2).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
-        // Regex langue-agnostique : cherche ":   USB\..." ou ":   HID\..."
-        // Ne dépend PAS du libellé ("Instance ID:" EN ou "ID d'instance :" FR)
-        // évite tous les problèmes d'apostrophe ou de locale
+        // Regex strict : cherche UNIQUEMENT les lignes "ID d'instance :" ou "Instance ID :"
+        // Ignore "ID matériels :", "ID compatibles :" qui ne sont pas des instance IDs valides
+        // pnputil /remove-device exige le format complet USB\VID_xxxx&PID_yyyy\<instance>
         private static readonly Regex InstanceIdRegex =
-            new Regex(@":\s+((?:USB|HID)\\[^\s]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+            new Regex(@"^(?:ID\s+d'instance|Instance\s+ID)\s*:\s+((?:USB|HID)\\[^\s]+)",
+                RegexOptions.IgnoreCase | RegexOptions.Multiline | RegexOptions.Compiled);
 
         private List<string> ParseVirpilIds(string pnputilStdout, string passLabel)
         {
