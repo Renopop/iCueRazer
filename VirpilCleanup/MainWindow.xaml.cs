@@ -379,7 +379,7 @@ namespace VirpilCleanup
                             try
                             {
                                 vendorKey.DeleteSubKeyTree(deviceId, throwOnMissingSubKey: false);
-                                Log($"  OK {enumPath[enumPath.LastIndexOf('\\') + 1..]}\\{vendorId}\\{deviceId}");
+                                Log($"  OK {enumPath[(enumPath.LastIndexOf('\\') + 1)..]}\\{vendorId}\\{deviceId}");
                                 count++;
                             }
                             catch (Exception ex) { Log($"  FAIL {ex.Message}"); }
