@@ -17,7 +17,7 @@ namespace VirpilCleanup
         public MainWindow()
         {
             InitializeComponent();
-            this.Title = "VIRPIL USB Device Cleaner";
+            this.Title = "VPC (VIRPIL) USB Device Cleaner";
             LoadDevicesInternal();
         }
 
@@ -28,50 +28,37 @@ namespace VirpilCleanup
         private void LoadDevicesInternal()
         {
             ClearLog();
-            Log("Détection des périphériques USB VIRPIL...");
+            Log("Détection des périphériques USB VPC (VIRPIL)...");
             virpilDevices.Clear();
 
             try
             {
+                // Recherche par manufacturier VPC (VirPil Controls)
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_USBHub"))
+                    "SELECT * FROM Win32_PnPEntity WHERE Manufacturer LIKE '%VPC%' OR Name LIKE '%VPC%'"))
                 {
                     foreach (ManagementObject obj in searcher.Get())
                     {
-                        string description = obj["Description"]?.ToString() ?? "";
+                        string name = obj["Name"]?.ToString() ?? "";
                         string deviceId = obj["DeviceID"]?.ToString() ?? "";
-
-                        if (IsVirpilDevice(description))
-                        {
-                            virpilDevices.Add(new USBDevice { Description = description, DeviceID = deviceId });
-                            Log($"✓ Trouvé: {description}");
-                        }
-                    }
-                }
-
-                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_PnPEntity WHERE Name LIKE '%VIRPIL%' OR Name LIKE '%VPC%'"))
-                {
-                    foreach (ManagementObject obj in searcher.Get())
-                    {
-                        string description = obj["Name"]?.ToString() ?? "";
-                        string deviceId = obj["DeviceID"]?.ToString() ?? "";
+                        string manufacturer = obj["Manufacturer"]?.ToString() ?? "";
 
                         if (!virpilDevices.Any(d => d.DeviceID == deviceId))
                         {
-                            virpilDevices.Add(new USBDevice { Description = description, DeviceID = deviceId });
-                            Log($"✓ Trouvé: {description}");
+                            virpilDevices.Add(new USBDevice { Description = $"{name} ({manufacturer})", DeviceID = deviceId });
+                            Log($"✓ Trouvé: {name}");
                         }
                     }
                 }
 
                 if (virpilDevices.Count == 0)
                 {
-                    Log("⚠ Aucun périphérique VIRPIL détecté.");
+                    Log("⚠ Aucun périphérique VPC (VPC (VIRPIL)) détecté.");
+                    Log("  Vérifiez que les contrôleurs sont branchés et visibles dans 'Gestionnaire de périphériques'.");
                 }
                 else
                 {
-                    Log($"\n✓ {virpilDevices.Count} périphérique(s) VIRPIL trouvé(s).");
+                    Log($"\n✓ {virpilDevices.Count} périphérique(s) VPC trouvé(s).");
                 }
             }
             catch (Exception ex)
@@ -86,20 +73,21 @@ namespace VirpilCleanup
                 return false;
 
             string upper = description.ToUpper();
-            return upper.Contains("VIRPIL") || upper.Contains("VPC");
+            // VPC = VirPil Controls (nom du manufacturier dans Windows)
+            return upper.Contains("VPC") || upper.Contains("VPC (VIRPIL)") || upper.Contains("JOYSTICK") && upper.Contains("VPC");
         }
 
         private void RemoveDevicesInternal()
         {
             if (virpilDevices.Count == 0)
             {
-                MessageBox.Show("Aucun périphérique VIRPIL à supprimer.", "Information",
+                MessageBox.Show("Aucun périphérique VPC (VIRPIL) à supprimer.", "Information",
                     MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
             MessageBoxResult result = MessageBox.Show(
-                $"Êtes-vous sûr de vouloir supprimer {virpilDevices.Count} périphérique(s) VIRPIL ?\n\n" +
+                $"Êtes-vous sûr de vouloir supprimer {virpilDevices.Count} périphérique(s) VPC (VIRPIL) ?\n\n" +
                 "Cette opération supprimera aussi les entrées du registre Windows.\n" +
                 "Vous devrez reconnecter les périphériques après.",
                 "Confirmation",
@@ -110,7 +98,7 @@ namespace VirpilCleanup
                 return;
 
             ClearLog();
-            Log("Suppression profonde des périphériques VIRPIL...\n");
+            Log("Suppression profonde des périphériques VPC (VIRPIL)...\n");
 
             int removed = 0;
             foreach (var device in virpilDevices)
@@ -123,7 +111,7 @@ namespace VirpilCleanup
             CleanRegistry();
 
             Log($"\n✓ {removed}/{virpilDevices.Count} périphérique(s) supprimé(s).");
-            Log("\nDéconnectez et reconnectez vos périphériques VIRPIL.");
+            Log("\nDéconnectez et reconnectez vos périphériques VPC (VIRPIL).");
             Log("Les drivers vont se réinstaller automatiquement.");
 
             System.Threading.Thread.Sleep(1000);
@@ -242,7 +230,7 @@ namespace VirpilCleanup
         private bool IsVirpilRegistryEntry(string entryName)
         {
             string upper = entryName.ToUpper();
-            return upper.Contains("VIRPIL") ||
+            return upper.Contains("VPC (VIRPIL)") ||
                    upper.Contains("VPC") ||
                    upper.Contains("THRUSTMASTER") ||
                    upper.Contains("WARTHOG");
