@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Security.Principal;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -114,6 +115,12 @@ namespace VirpilCleanup
             return pass1.Concat(pass2).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
+        // Regex langue-agnostique : cherche ":   USB\..." ou ":   HID\..."
+        // Ne dépend PAS du libellé ("Instance ID:" EN ou "ID d'instance :" FR)
+        // évite tous les problèmes d'apostrophe ou de locale
+        private static readonly Regex InstanceIdRegex =
+            new Regex(@":\s+((?:USB|HID)\\[^\s]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
         private List<string> ParseVirpilIds(string pnputilStdout, string passLabel)
         {
             var result = new List<string>();
@@ -122,11 +129,7 @@ namespace VirpilCleanup
             foreach (var line in pnputilStdout.Split('\n'))
             {
                 string t = line.Trim();
-                // Chercher le préfixe Instance ID en anglais OU en français (ID d'instance)
-                if ((t.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase) ||
-                     t.StartsWith("ID d'instance :", StringComparison.OrdinalIgnoreCase) ||
-                     t.StartsWith("ID d'instance:", StringComparison.OrdinalIgnoreCase))
-                    || t.ToUpperInvariant().Contains(VIRPIL_VID))
+                if (t.ToUpperInvariant().Contains(VIRPIL_VID) || InstanceIdRegex.IsMatch(t))
                     Log($"  {t}");
             }
             Log("");
@@ -137,29 +140,14 @@ namespace VirpilCleanup
             foreach (string rawLine in pnputilStdout.Split('\n'))
             {
                 string line = rawLine.Trim();
+                var m = InstanceIdRegex.Match(line);
 
-                // Détecter "Instance ID:" (EN) ou "ID d'instance :" (FR)
-                // Chercher le dernier ':' car le préfixe peut varier légèrement
-                bool isInstanceIdLine = false;
-                int colonIdx = -1;
-                if (line.StartsWith("Instance ID:", StringComparison.OrdinalIgnoreCase))
-                {
-                    isInstanceIdLine = true;
-                    colonIdx = line.IndexOf(':');
-                }
-                else if (line.StartsWith("ID d'instance:", StringComparison.OrdinalIgnoreCase) ||
-                         line.StartsWith("ID d'instance :", StringComparison.OrdinalIgnoreCase))
-                {
-                    isInstanceIdLine = true;
-                    colonIdx = line.LastIndexOf(':');
-                }
-
-                if (isInstanceIdLine && colonIdx >= 0)
+                if (m.Success)
                 {
                     if (currentId != null && isVirpil)
                         result.Add(currentId);
 
-                    currentId = line.Substring(colonIdx + 1).Trim();
+                    currentId = m.Groups[1].Value.Trim();
                     isVirpil = false;
                 }
                 else if (line.ToUpperInvariant().Contains(VIRPIL_VID))
