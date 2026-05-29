@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Principal;
@@ -20,11 +19,6 @@ namespace VirpilCleanup
 
         private static readonly string PnpUtil =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "pnputil.exe");
-
-        // pnputil est un exe Win32 console : il écrit en OEM (CP850 sur FR, CP437 sur EN)
-        // Forcer UTF-8 corrompt les caractères et peut casser les instance IDs
-        private static readonly Encoding OemEncoding =
-            Encoding.GetEncoding(CultureInfo.InstalledUICulture.TextInfo.OEMCodePage);
 
         private List<string> foundInstanceIds = new();
 
@@ -252,8 +246,6 @@ namespace VirpilCleanup
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true,
-                StandardOutputEncoding = OemEncoding,
-                StandardErrorEncoding  = OemEncoding,
             };
 
             using var proc = Process.Start(psi)!;
