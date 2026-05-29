@@ -1,0 +1,22 @@
+## Build results
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.log
+
+## IDE
+.vs/
+.vscode/
+*.csproj.user
+*.suo
+
+## OS
+Thumbs.db
+.DS_Store
+
+## Temp files
+*.tmp
+*.bak
+~*.*
