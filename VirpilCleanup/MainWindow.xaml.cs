@@ -190,39 +190,53 @@ namespace VirpilCleanup
 
         private void RemoveViaPowerShell(List<USBDevice> devices)
         {
-            // Remove-PnpDevice fonctionne sur les appareils connectés ET les ghosts (déconnectés)
-            // On passe tous les InstanceId d'un seul coup via un pipeline PowerShell
-            var ids = devices.Select(d => d.PnpInstanceId.Replace("'", "''")).ToList();
+            Log($"  {devices.Count} instance(s) à supprimer...\n");
 
-            foreach (var device in devices)
-                Log($"  → {device.Name}");
-
-            Log("");
-
-            // Construire le script PowerShell
-            // On utilise [array] pour forcer le pipeline même si un seul élément
-            var idList = string.Join(",", ids.Select(id => $"'{id}'"));
-            string script = $@"
+            // Script écrit dans un fichier temp pour éviter tout problème d'échappement
+            // Get-PnpDevice cherche par HardwareID directement — plus fiable que les InstanceId
+            string script = @"
 $ErrorActionPreference = 'Continue'
-$ids = @({idList})
-foreach ($id in $ids) {{
-    try {{
-        $dev = Get-PnpDevice -InstanceId $id -ErrorAction SilentlyContinue
-        if ($dev) {{
-            $dev | Remove-PnpDevice -Confirm:$false -ErrorAction Stop
-            Write-Output ""OK: $id""
-        }} else {{
-            Write-Output ""GHOST: $id (non connecte, suppression registre uniquement)""
-        }}
-    }} catch {{
-        Write-Output ""ERREUR $id : $($_.Exception.Message)""
-    }}
-}}
+
+# Chercher tous les périphériques VIRPIL (connectés + ghosts déconnectés)
+$all = Get-PnpDevice | Where-Object { $_.HardwareID -match 'VID_3344' }
+
+if ($all.Count -eq 0) {
+    Write-Output 'AUCUN peripherique VID_3344 trouve via Get-PnpDevice'
+    exit 0
+}
+
+Write-Output ""Trouvé $($all.Count) périphérique(s) VID_3344""
+
+foreach ($dev in $all) {
+    $label = if ($dev.FriendlyName) { $dev.FriendlyName } else { $dev.InstanceId }
+    Write-Output ""  Suppression: $label""
+    try {
+        Remove-PnpDevice -InstanceId $dev.InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Output ""    OK""
+    } catch {
+        Write-Output ""    ERREUR: $($_.Exception.Message)""
+    }
+}
+
+Write-Output 'Terminé.'
 ";
-            RunPowerShell(script);
+
+            string tempFile = System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(),
+                "virpil_remove.ps1");
+
+            try
+            {
+                System.IO.File.WriteAllText(tempFile, script, System.Text.Encoding.UTF8);
+                RunPowerShellFile(tempFile);
+            }
+            finally
+            {
+                try { System.IO.File.Delete(tempFile); } catch { }
+            }
         }
 
-        private void RunPowerShell(string script)
+        private void RunPowerShellFile(string scriptPath)
         {
             try
             {
@@ -236,7 +250,8 @@ foreach ($id in $ids) {{
                 var psi = new ProcessStartInfo
                 {
                     FileName = psExe,
-                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -Command \"{script.Replace("\"", "\\\"")}\"",
+                    // -File (pas -Command) : pas d'échappement, supporte les scripts longs
+                    Arguments = $"-NoProfile -ExecutionPolicy Bypass -File \"{scriptPath}\"",
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -249,14 +264,20 @@ foreach ($id in $ids) {{
                 proc.WaitForExit();
 
                 foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-                    Log($"  {line.Trim()}");
+                    Log($"  {line.TrimEnd()}");
 
                 if (!string.IsNullOrWhiteSpace(stderr))
-                    Log($"  ⚠  {stderr.Trim()}");
+                {
+                    Log("  ── Erreurs PowerShell ──");
+                    foreach (string line in stderr.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                        Log($"  ⚠  {line.TrimEnd()}");
+                }
+
+                Log($"\n  [Code retour PowerShell: {proc.ExitCode}]");
             }
             catch (Exception ex)
             {
-                Log($"  ✗ Erreur PowerShell: {ex.Message}");
+                Log($"  ✗ Impossible de lancer PowerShell: {ex.Message}");
             }
         }
 
