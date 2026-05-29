@@ -5,7 +5,6 @@ using System.Linq;
 using System.Management;
 using System.Text;
 using System.Windows;
-using System.Windows.Controls;
 using Microsoft.Win32;
 
 namespace VirpilCleanup
@@ -22,15 +21,9 @@ namespace VirpilCleanup
             LoadDevicesInternal();
         }
 
-        private void LoadDevices(object sender, RoutedEventArgs e)
-        {
-            LoadDevicesInternal();
-        }
+        private void LoadDevices_Click(object sender, RoutedEventArgs e) => LoadDevicesInternal();
 
-        private void RemoveDevices(object sender, RoutedEventArgs e)
-        {
-            RemoveDevicesInternal();
-        }
+        private void RemoveDevices_Click(object sender, RoutedEventArgs e) => RemoveDevicesInternal();
 
         private void LoadDevicesInternal()
         {
@@ -57,14 +50,14 @@ namespace VirpilCleanup
                 }
 
                 using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_PnPDevice WHERE ClassGuid=\"{4d1e55b2-f16f-11cf-88cb-001111000030}\""))
+                    "SELECT * FROM Win32_PnPEntity WHERE Name LIKE '%VIRPIL%' OR Name LIKE '%VPC%'"))
                 {
                     foreach (ManagementObject obj in searcher.Get())
                     {
-                        string description = obj["Description"]?.ToString() ?? "";
+                        string description = obj["Name"]?.ToString() ?? "";
                         string deviceId = obj["DeviceID"]?.ToString() ?? "";
 
-                        if (IsVirpilDevice(description) && !virpilDevices.Any(d => d.DeviceID == deviceId))
+                        if (!virpilDevices.Any(d => d.DeviceID == deviceId))
                         {
                             virpilDevices.Add(new USBDevice { Description = description, DeviceID = deviceId });
                             Log($"✓ Trouvé: {description}");
@@ -126,7 +119,7 @@ namespace VirpilCleanup
                     removed++;
             }
 
-            Log($"\n{'='} Nettoyage du registre Windows...\n");
+            Log("\n====== Nettoyage du registre Windows... ======\n");
             CleanRegistry();
 
             Log($"\n✓ {removed}/{virpilDevices.Count} périphérique(s) supprimé(s).");
@@ -143,17 +136,7 @@ namespace VirpilCleanup
             {
                 Log($"Suppression: {device.Description}...");
 
-                string deviceId = device.DeviceID.Replace("\\", "\\\\");
-
-                using (ManagementObject obj = new ManagementObject(
-                    $"\\\\.\root\\cimv2:Win32_PnPDevice.DeviceID=\"{deviceId}\""))
-                {
-                    ManagementBaseObject inParams = obj.GetMethodParameters("Disable");
-                    obj.InvokeMethod("Disable", inParams, null);
-                    Log($"  ✓ Désactivé");
-                }
-
-                System.Threading.Thread.Sleep(500);
+                System.Threading.Thread.Sleep(200);
 
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
