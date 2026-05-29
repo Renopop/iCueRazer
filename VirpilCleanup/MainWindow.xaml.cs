@@ -186,8 +186,15 @@ namespace VirpilCleanup
             ClearLog();
             Log($"=== SUPPRESSION {foundInstanceIds.Count} instance(s) VIRPIL ===\n");
 
+            // HID enfants en premier, puis USB parents
+            // Supprimer un parent USB avant ses enfants HID peut bloquer la suppression
+            var snapshot = foundInstanceIds
+                .OrderBy(id => id.StartsWith("USB\\", StringComparison.OrdinalIgnoreCase) ? 1 : 0)
+                .ToList();
+
+            Log("Ordre de suppression : HID (enfants) avant USB (parents)\n");
+
             int ok = 0, fail = 0;
-            var snapshot = foundInstanceIds.ToList();
 
             for (int i = 0; i < snapshot.Count; i++)
             {
@@ -213,9 +220,6 @@ namespace VirpilCleanup
                 }
                 else
                 {
-                    // BUG CORRIGE : succès déterminé par le code de retour réel de pnputil
-                    // L'ancienne heuristique par string matching (OK/SUCCESS/ERROR…) avait
-                    // un bug de précédence &&/|| et considérait presque tout comme succès
                     Log($"  Code retour : {r.ExitCode}");
                     if (r.ExitCode == 0) ok++; else fail++;
                 }
@@ -227,10 +231,17 @@ namespace VirpilCleanup
             Log($"{cleaned} entree(s) DeviceClasses supprimee(s).\n");
 
             Log($"=== TERMINE : {ok} OK  /  {fail} echec(s) ===");
-            Log("\n!!! DEBRANCHEZ VOS CONTROLEURS VIRPIL MAINTENANT !!!");
-            Log("Puis redemarrez le PC et rebranchez pour reinstaller.");
 
-            await Task.Delay(1500);
+            // Pause obligatoire : Windows reenumere les peripheriques encore branches.
+            // L'utilisateur doit debrancher AVANT qu'on rescanne.
+            MessageBox.Show(
+                $"Suppression terminee : {ok} OK, {fail} echec(s).\n\n" +
+                "DEBRANCHEZ MAINTENANT tous vos controleurs VIRPIL/VPC\n" +
+                "avant de cliquer OK.\n\n" +
+                "Si vous ne les debranchez pas, Windows va les reenumerer\n" +
+                "immediatement et ils reapparaitront dans la liste.",
+                "Action requise", MessageBoxButton.OK, MessageBoxImage.Warning);
+
             await ScanAsync();
         }
 
