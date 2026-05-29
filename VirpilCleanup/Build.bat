@@ -20,6 +20,6 @@ echo.
 color 0A
 echo Build SUCCESS
 echo.
-echo Executable: bin\Release\net6.0-windows\VirpilCleanup.exe
+echo Executable: bin\Release\net9.0-windows\VirpilCleanup.exe
 echo.
 pause

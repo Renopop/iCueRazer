@@ -10,6 +10,7 @@
     <StartupObject>VirpilCleanup.App</StartupObject>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
   </PropertyGroup>
 
 
