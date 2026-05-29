@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using Microsoft.Win32;
 
@@ -23,30 +24,38 @@ namespace VirpilCleanup
         {
             InitializeComponent();
             this.Title = "VPC (VIRPIL) USB Device Cleaner";
-            LoadDevicesInternal();
+            _ = LoadDevicesAsync();
         }
 
-        private void LoadDevices_Click(object sender, RoutedEventArgs e) => LoadDevicesInternal();
-        private void RemoveDevices_Click(object sender, RoutedEventArgs e) => RemoveDevicesInternal();
+        private async void LoadDevices_Click(object sender, RoutedEventArgs e)
+        {
+            SetButtonsEnabled(false);
+            await LoadDevicesAsync();
+            SetButtonsEnabled(true);
+        }
 
-        private void LoadDevicesInternal()
+        private async void RemoveDevices_Click(object sender, RoutedEventArgs e)
+        {
+            SetButtonsEnabled(false);
+            await RemoveDevicesAsync();
+            SetButtonsEnabled(true);
+        }
+
+        private void SetButtonsEnabled(bool enabled)
+        {
+            RefreshButton.IsEnabled = enabled;
+            RemoveButton.IsEnabled = enabled;
+        }
+
+        private async Task LoadDevicesAsync()
         {
             ClearLog();
             Log($"Recherche par Vendor ID USB {VIRPIL_VID} (VIRPIL Controls)...");
             Log("Cette méthode trouve les périphériques même si Windows ne les reconnaît pas.\n");
-            virpilDevices.Clear();
 
-            // Chemin USB principal + HID (joystick/gamepad passent par HID)
-            string[] registryRoots = new[]
-            {
-                @"SYSTEM\CurrentControlSet\Enum\USB",
-                @"SYSTEM\CurrentControlSet\Enum\HID",
-            };
+            var found = await Task.Run(() => ScanRegistry());
 
-            foreach (string root in registryRoots)
-            {
-                ScanRegistryForVID(root);
-            }
+            virpilDevices = found;
 
             if (virpilDevices.Count == 0)
             {
@@ -61,52 +70,60 @@ namespace VirpilCleanup
             }
         }
 
-        private void ScanRegistryForVID(string registryPath)
+        private List<USBDevice> ScanRegistry()
         {
-            try
+            var result = new List<USBDevice>();
+            string[] registryRoots = new[]
             {
-                using RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
-                using RegistryKey baseKey = root.OpenSubKey(registryPath);
-                if (baseKey == null) return;
+                @"SYSTEM\CurrentControlSet\Enum\USB",
+                @"SYSTEM\CurrentControlSet\Enum\HID",
+            };
 
-                foreach (string deviceKeyName in baseKey.GetSubKeyNames())
+            foreach (string root in registryRoots)
+            {
+                try
                 {
-                    if (!deviceKeyName.ToUpper().Contains(VIRPIL_VID))
-                        continue;
+                    using RegistryKey baseReg = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                    using RegistryKey baseKey = baseReg.OpenSubKey(root);
+                    if (baseKey == null) continue;
 
-                    using RegistryKey deviceKey = baseKey.OpenSubKey(deviceKeyName);
-                    if (deviceKey == null) continue;
-
-                    // Chaque sous-clé est une instance du périphérique
-                    foreach (string instanceId in deviceKey.GetSubKeyNames())
+                    foreach (string deviceKeyName in baseKey.GetSubKeyNames())
                     {
-                        using RegistryKey instanceKey = deviceKey.OpenSubKey(instanceId);
-                        string friendlyName = instanceKey?.GetValue("FriendlyName")?.ToString()
-                                          ?? instanceKey?.GetValue("DeviceDesc")?.ToString()
-                                          ?? "(Périphérique inconnu)";
+                        if (!deviceKeyName.ToUpper().Contains(VIRPIL_VID))
+                            continue;
 
-                        string fullInstancePath = $@"{registryPath}\{deviceKeyName}\{instanceId}";
-                        string pnpInstanceId = $@"{deviceKeyName}\{instanceId}";
+                        using RegistryKey deviceKey = baseKey.OpenSubKey(deviceKeyName);
+                        if (deviceKey == null) continue;
 
-                        virpilDevices.Add(new USBDevice
+                        foreach (string instanceId in deviceKey.GetSubKeyNames())
                         {
-                            Description = $"{friendlyName}  [{deviceKeyName}]",
-                            DeviceID = pnpInstanceId,
-                            RegistryPath = fullInstancePath
-                        });
+                            using RegistryKey instanceKey = deviceKey.OpenSubKey(instanceId);
+                            string friendlyName = instanceKey?.GetValue("FriendlyName")?.ToString()
+                                              ?? instanceKey?.GetValue("DeviceDesc")?.ToString()
+                                              ?? "(Périphérique inconnu)";
 
-                        Log($"  ✓ {friendlyName}");
-                        Log($"      ID: {pnpInstanceId}");
+                            result.Add(new USBDevice
+                            {
+                                Description = $"{friendlyName}  [{deviceKeyName}]",
+                                DeviceID = $@"{deviceKeyName}\{instanceId}",
+                                RegistryPath = $@"{root}\{deviceKeyName}\{instanceId}"
+                            });
+
+                            Log($"  ✓ {friendlyName}");
+                            Log($"      ID: {deviceKeyName}\\{instanceId}");
+                        }
                     }
                 }
+                catch (Exception ex)
+                {
+                    Log($"  ⚠  Erreur lecture registre ({root}): {ex.Message}");
+                }
             }
-            catch (Exception ex)
-            {
-                Log($"  ⚠  Erreur lecture registre ({registryPath}): {ex.Message}");
-            }
+
+            return result;
         }
 
-        private void RemoveDevicesInternal()
+        private async Task RemoveDevicesAsync()
         {
             if (virpilDevices.Count == 0)
             {
@@ -131,16 +148,19 @@ namespace VirpilCleanup
             ClearLog();
             Log("=== Suppression des périphériques VIRPIL ===\n");
 
-            // Étape 1 : pnputil pour désinstaller les drivers
-            Log("── Étape 1 : désinstallation via pnputil...\n");
-            foreach (var device in virpilDevices)
-            {
-                RemoveViaPnpUtil(device);
-            }
+            var devicesToRemove = virpilDevices.ToList();
 
-            // Étape 2 : nettoyage registre par VID
+            // Étape 1 : pnputil
+            Log("── Étape 1 : désinstallation via pnputil...\n");
+            await Task.Run(() =>
+            {
+                foreach (var device in devicesToRemove)
+                    RemoveViaPnpUtil(device);
+            });
+
+            // Étape 2 : registre
             Log("\n── Étape 2 : nettoyage du registre (VID_3344)...\n");
-            int cleaned = CleanRegistryByVID();
+            int cleaned = await Task.Run(() => CleanRegistryByVID());
 
             Log($"\n✓ Terminé — {cleaned} entrée(s) de registre supprimée(s).");
             Log("\nÉtapes suivantes :");
@@ -148,8 +168,8 @@ namespace VirpilCleanup
             Log("  2. Rebranchez les contrôleurs VIRPIL");
             Log("  3. Windows les réinstallera automatiquement");
 
-            System.Threading.Thread.Sleep(800);
-            LoadDevicesInternal();
+            await Task.Delay(800);
+            await LoadDevicesAsync();
         }
 
         private void RemoveViaPnpUtil(USBDevice device)
@@ -165,12 +185,10 @@ namespace VirpilCleanup
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
-                    CreateNoWindow = true,
-                    Verb = "runas"
+                    CreateNoWindow = true
                 };
 
-                using Process proc = Process.Start(psi);
-                string output = proc.StandardOutput.ReadToEnd();
+                using Process proc = Process.Start(psi)!;
                 proc.WaitForExit();
 
                 Log(proc.ExitCode == 0 ? "    ✓ Supprimé" : $"    ⚠  Code retour {proc.ExitCode} (peut être ignoré)");
@@ -192,9 +210,7 @@ namespace VirpilCleanup
             };
 
             foreach (string root in registryRoots)
-            {
                 count += DeleteVIDKeysUnder(root);
-            }
 
             return count;
         }
@@ -205,7 +221,7 @@ namespace VirpilCleanup
             try
             {
                 using RegistryKey rootKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
-                using RegistryKey baseKey = rootKey.OpenSubKey(registryPath, writable: true);
+                using RegistryKey baseKey = rootKey.OpenSubKey(registryPath, writable: true)!;
                 if (baseKey == null) return 0;
 
                 var toDelete = baseKey.GetSubKeyNames()
@@ -226,11 +242,8 @@ namespace VirpilCleanup
                     }
                 }
 
-                // Pour DeviceClasses, VID peut être dans les sous-clés
                 if (registryPath.Contains("DeviceClasses"))
-                {
                     count += CleanDeviceClasses(baseKey);
-                }
             }
             catch (Exception ex)
             {
@@ -247,7 +260,7 @@ namespace VirpilCleanup
             {
                 try
                 {
-                    using RegistryKey classKey = baseKey.OpenSubKey(classGuid, writable: true);
+                    using RegistryKey classKey = baseKey.OpenSubKey(classGuid, writable: true)!;
                     if (classKey == null) continue;
 
                     var toDelete = classKey.GetSubKeyNames()
@@ -273,18 +286,17 @@ namespace VirpilCleanup
         private void Log(string message)
         {
             logBuffer.AppendLine(message);
-            Dispatcher.Invoke(() =>
+            Dispatcher.BeginInvoke(() =>
             {
-                if (LogTextBox != null)
-                    LogTextBox.Text = logBuffer.ToString();
+                LogTextBox.Text = logBuffer.ToString();
+                LogTextBox.ScrollToEnd();
             });
         }
 
         private void ClearLog()
         {
             logBuffer.Clear();
-            if (LogTextBox != null)
-                LogTextBox.Text = "";
+            Dispatcher.Invoke(() => LogTextBox.Text = "");
         }
     }
 
