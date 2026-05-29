@@ -201,7 +201,7 @@ namespace VirpilCleanup
                 string instanceId = snapshot[i];
                 Log($"[{i + 1}/{snapshot.Count}] {instanceId}");
 
-                string args = $"/remove-device \"{instanceId}\" /uninstall";
+                string args = $"/remove-device \"{instanceId}\" /subtree /uninstall /force";
                 Log($"  pnputil {args}");
 
                 var r = await Task.Run(() => RunProcess(PnpUtil, args));
@@ -229,6 +229,10 @@ namespace VirpilCleanup
             Log("\n--- Nettoyage DeviceClasses ---\n");
             int cleaned = await Task.Run(CleanDeviceClasses);
             Log($"{cleaned} entree(s) DeviceClasses supprimee(s).\n");
+
+            Log("--- Nettoyage Enum\\USB et Enum\\HID ---\n");
+            int enumCleaned = await Task.Run(CleanEnumRegistry);
+            Log($"{enumCleaned} entree(s) Enum supprimee(s).\n");
 
             Log($"=== TERMINE : {ok} OK  /  {fail} echec(s) ===");
 
@@ -327,6 +331,64 @@ namespace VirpilCleanup
                 }
             }
             catch (Exception ex) { Log($"  FAIL DeviceClasses: {ex.Message}"); }
+
+            return count;
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // ENUM  –  nettoyage des arbres USB et HID en registre
+        // ─────────────────────────────────────────────────────────────────
+
+        private int CleanEnumRegistry()
+        {
+            int count = 0;
+            const string enumUsbPath = @"SYSTEM\CurrentControlSet\Enum\USB";
+            const string enumHidPath = @"SYSTEM\CurrentControlSet\Enum\HID";
+
+            try
+            {
+                using var hklm = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default);
+                count += CleanEnumPath(hklm, enumUsbPath);
+                count += CleanEnumPath(hklm, enumHidPath);
+            }
+            catch (Exception ex) { Log($"  FAIL CleanEnum: {ex.Message}"); }
+
+            return count;
+        }
+
+        private int CleanEnumPath(RegistryKey hklm, string enumPath)
+        {
+            int count = 0;
+
+            try
+            {
+                using var enumKey = hklm.OpenSubKey(enumPath);
+                if (enumKey == null) return 0;
+
+                foreach (string vendorId in enumKey.GetSubKeyNames().ToList())
+                {
+                    if (!vendorId.ToUpperInvariant().Contains(VIRPIL_VID)) continue;
+
+                    try
+                    {
+                        using var vendorKey = hklm.OpenSubKey($@"{enumPath}\{vendorId}", writable: true);
+                        if (vendorKey == null) continue;
+
+                        foreach (string deviceId in vendorKey.GetSubKeyNames().ToList())
+                        {
+                            try
+                            {
+                                vendorKey.DeleteSubKeyTree(deviceId, throwOnMissingSubKey: false);
+                                Log($"  OK {enumPath[enumPath.LastIndexOf('\\') + 1..]}\\{vendorId}\\{deviceId}");
+                                count++;
+                            }
+                            catch (Exception ex) { Log($"  FAIL {ex.Message}"); }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
 
             return count;
         }
